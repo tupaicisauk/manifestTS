@@ -10,8 +10,8 @@ intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
-FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
+DISCORD_CHANNEL_ID = os.getenv("DISCORD_CHANNEL_ID")
+FOLDER_ID = os.getenv("FOLDER_ID")
 
 # ===== GOOGLE DRIVE SETUP =====
 def get_google_service():
