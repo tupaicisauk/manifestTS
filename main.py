@@ -37,7 +37,6 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds)
 
 FOLDER_ID = os.getenv("FOLDER_ID")
-known_files = {}
 
 # ====== BOT EVENTS ======
 @bot.event
@@ -49,57 +48,39 @@ async def on_ready():
     except Exception as e:
         print(f"❌ Error sync commands: {e}")
 
-# ====== COMMAND: /gen ======
-@bot.tree.command(name="gen", description="Generate laporan Added/Updated file dari Google Drive")
-async def gen(interaction: discord.Interaction):
+# ====== COMMAND: /gen [appid] ======
+@bot.tree.command(name="gen", description="Ambil manifest tertentu dari Google Drive (contoh: /gen 10)")
+@app_commands.describe(appid="Nomor AppID (misal: 10)")
+async def gen(interaction: discord.Interaction, appid: str):
     await interaction.response.defer(thinking=True)
 
     drive_service = get_drive_service()
+    file_name = f"{appid}.zip"
 
     results = drive_service.files().list(
-        q=f"'{FOLDER_ID}' in parents and name contains '.zip'",
+        q=f"'{FOLDER_ID}' in parents and name='{file_name}'",
         fields="files(id, name, createdTime, modifiedTime, webViewLink)"
     ).execute()
     files = results.get("files", [])
 
     if not files:
-        await interaction.followup.send("⚠️ Tidak ada file .zip di Google Drive.")
+        await interaction.followup.send(f"⚠️ File `{file_name}` tidak ditemukan di Google Drive.")
         return
 
-    embed_list = []
-    global known_files
+    file = files[0]
+    created = datetime.datetime.fromisoformat(file["createdTime"][:-1])
+    modified = datetime.datetime.fromisoformat(file["modifiedTime"][:-1])
 
-    for file in files:
-        file_id = file["id"]
-        name = file["name"]
-        created = datetime.datetime.fromisoformat(file["createdTime"][:-1])
-        modified = datetime.datetime.fromisoformat(file["modifiedTime"][:-1])
-        link = file["webViewLink"]
+    embed = discord.Embed(
+        title=f"📦 Manifest Found: {file['name']}",
+        description=f"[🔗 Open File]({file['webViewLink']})",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="Upload date", value=created.strftime("%Y-%m-%d"), inline=True)
+    embed.add_field(name="Updated date", value=modified.strftime("%Y-%m-%d"), inline=True)
+    embed.set_footer(text="Generated via Google Drive API")
 
-        status = "🆕 Added"
-        if file_id in known_files:
-            if modified > known_files[file_id]["modified"]:
-                status = "♻️ Updated"
-            else:
-                continue
-
-        known_files[file_id] = {"modified": modified}
-
-        embed = discord.Embed(
-            title=f"{status}: {name}",
-            description=f"[🔗 Open File]({link})",
-            color=discord.Color.green() if status == "🆕 Added" else discord.Color.orange()
-        )
-        embed.add_field(name="Upload date", value=created.strftime("%Y-%m-%d"), inline=True)
-        embed.add_field(name="Updated date", value=modified.strftime("%Y-%m-%d"), inline=True)
-        embed.set_footer(text="Generated via Google Drive API")
-        embed_list.append(embed)
-
-    if not embed_list:
-        await interaction.followup.send("✅ Tidak ada file baru/updated.")
-    else:
-        for embed in embed_list:
-            await interaction.followup.send(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 # ====== START ======
 keep_alive()
