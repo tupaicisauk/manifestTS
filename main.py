@@ -1,125 +1,117 @@
+import os, json, requests
 import discord
-from discord.ext import commands
-from flask import Flask
-from threading import Thread
-import os
-import requests
+from discord import app_commands
+from discord.ext import commands, tasks
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
 
-# ====== KEEP ALIVE SERVER ======
-app = Flask('')
-
-
-@app.route('/')
-def home():
-    return "Bot is alive!"
-
-
-def run():
-    app.run(host='0.0.0.0', port=8080)
-
-
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
-
-
-# ====== DISCORD BOT ======
+# ===== DISCORD SETUP =====
 intents = discord.Intents.default()
-intents.message_content = True
-
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
+FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
 
-@bot.event
-async def on_ready():
-    await bot.tree.sync()  # Sinkronisasi slash command ke Discord
-    print(f"✅ Bot {bot.user} sudah online dengan slash command!")
+# ===== GOOGLE DRIVE SETUP =====
+def get_google_service():
+    creds = Credentials(
+        token=os.getenv("GOOGLE_ACCESS_TOKEN"),
+        refresh_token=os.getenv("GOOGLE_REFRESH_TOKEN"),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=os.getenv("GOOGLE_CLIENT_ID"),
+        client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
+        scopes=["https://www.googleapis.com/auth/drive"]
+    )
+    return build("drive", "v3", credentials=creds)
 
+# ===== STORAGE FILE (tracking update) =====
+SEEN_FILE = "seen.json"
+if not os.path.exists(SEEN_FILE):
+    with open(SEEN_FILE, "w") as f: json.dump({}, f)
 
-# ====== SLASH COMMAND /ping ======
-@bot.tree.command(name="ping", description="Cek apakah bot online")
-async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("Pong! 🏓")
+def load_seen(): return json.load(open(SEEN_FILE))
+def save_seen(d): json.dump(d, open(SEEN_FILE, "w"), indent=2)
 
-
-# ====== SLASH COMMAND /gen ======
-@bot.tree.command(name="gen",
-                  description="Generate manifest untuk game berdasarkan AppID")
-async def gen(interaction: discord.Interaction, appid: str):
-    folder = "manifests"
-    os.makedirs(folder, exist_ok=True)
-    file_path = os.path.join(folder, f"{appid}.zip")
-
-    # URL GitHub branch zip
-    zip_url = f"https://github.com/SteamAutoCracks/ManifestHub/archive/refs/heads/{appid}.zip"
-
-    # Default info
-    game_name = f"AppID {appid}"
-    steam_link = f"https://store.steampowered.com/app/{appid}/"
-    steamdb_link = f"https://steamdb.info/app/{appid}/"
-    cover_img = None
-
-    # Coba ambil data dari Steam API
-    try:
-        steam_api = f"https://store.steampowered.com/api/appdetails?appids={appid}"
-        r = requests.get(steam_api, timeout=10)
-        data = r.json()
-        if data[str(appid)]["success"]:
-            game_data = data[str(appid)]["data"]
-            game_name = game_data["name"]
-            cover_img = game_data.get("header_image")
-    except Exception as e:
-        print(f"Gagal ambil data Steam: {e}")
-
-    # Buat Embed
+# ===== DISCORD EMBED REPORT =====
+async def send_report(channel, filename, status, mtime):
+    appid = filename.replace(".zip","")
+    color = 0x00ff00 if status == "Added" else 0xffa500
     embed = discord.Embed(
-        title=f"✅ Manifest Generated: {game_name}",
-        description=
-        f"Successfully generated manifest files for **{game_name}** (`{appid}`)",
-        color=0x2ecc71)
+        title=f"{status}: {appid}",
+        description=f"Manifest `{filename}`",
+        color=color
+    )
     embed.add_field(
         name="Links",
-        value=f"[Steam Store]({steam_link}) | [SteamDB]({steamdb_link})",
-        inline=False)
+        value=f"[Steam Store](https://store.steampowered.com/app/{appid}) | "
+              f"[SteamDB](https://steamdb.info/app/{appid}/)",
+        inline=False
+    )
+    embed.add_field(name="Updated", value=mtime, inline=True)
+    await channel.send(embed=embed)
 
+# ===== LOOP CHECK GOOGLE DRIVE =====
+@tasks.loop(minutes=5)
+async def check_drive():
+    service = get_google_service()
+    results = service.files().list(
+        q=f"'{FOLDER_ID}' in parents",
+        fields="files(id, name, modifiedTime)"
+    ).execute()
+    files = results.get("files", [])
+
+    seen = load_seen()
+    channel = bot.get_channel(DISCORD_CHANNEL_ID)
+
+    for f in files:
+        name, mtime = f["name"], f["modifiedTime"]
+        if name not in seen:
+            await send_report(channel, name, "Added", mtime)
+        elif seen[name] != mtime:
+            await send_report(channel, name, "Updated", mtime)
+        seen[name] = mtime
+
+    save_seen(seen)
+
+# ===== SLASH COMMAND /gen =====
+@bot.tree.command(name="gen", description="Generate manifest dari Google Drive")
+@app_commands.describe(appid="Masukkan AppID game")
+async def gen(interaction: discord.Interaction, appid: str):
+    await interaction.response.defer()
+    service = get_google_service()
+    query = f"name='{appid}.zip' and '{FOLDER_ID}' in parents"
+    results = service.files().list(q=query, fields="files(id, name)").execute()
+    files = results.get("files", [])
+    if not files:
+        await interaction.followup.send(f"❌ Manifest {appid} not found.")
+        return
+
+    file_id = files[0]["id"]
+    download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    r = requests.get(download_url)
+
+    temp_path = f"/tmp/{appid}.zip"
+    with open(temp_path, "wb") as f:
+        f.write(r.content)
+
+    embed = discord.Embed(
+        title=f"✅ Manifest Generated: AppID {appid}",
+        description=f"Successfully generated manifest for `{appid}`",
+        color=0x2ecc71
+    )
+    await interaction.followup.send(embed=embed, file=discord.File(temp_path))
+
+# ===== BOT EVENT =====
+@bot.event
+async def on_ready():
+    print(f"✅ Bot {bot.user} online!")
     try:
-        # Kalau file belum ada → download dari GitHub
-        if not os.path.exists(file_path):
-            r = requests.get(zip_url, timeout=20)
-            if r.status_code == 200:
-                with open(file_path, "wb") as f:
-                    f.write(r.content)
-            else:
-                embed.color = 0xe74c3c
-                embed.add_field(
-                    name="Manifest Status",
-                    value=
-                    f"❌ Gagal download dari GitHub (HTTP {r.status_code})",
-                    inline=False)
-                await interaction.response.send_message(embed=embed)
-                return
-
-        # Kalau berhasil → attach file + gambar
-        embed.add_field(name="Manifest Status",
-                        value="✅ Manifest downloaded successfully",
-                        inline=False)
-        if cover_img:
-            embed.set_image(url=cover_img)
-
-        await interaction.response.send_message(embed=embed,
-                                                file=discord.File(file_path))
-
-        # Hapus file setelah dikirim (hemat storage)
-        os.remove(file_path)
-
+        synced = await bot.tree.sync()
+        print(f"Slash commands synced: {len(synced)}")
     except Exception as e:
-        embed.color = 0xe74c3c
-        embed.add_field(name="Manifest Status",
-                        value=f"❌ Error: {str(e)}",
-                        inline=False)
-        await interaction.response.send_message(embed=embed)
+        print("Error syncing commands:", e)
+    check_drive.start()
 
-
-# ====== RUN BOT ======
-keep_alive()
-bot.run(os.getenv("TOKEN"))  # Token disimpan di Replit Secrets
+# ===== RUN BOT =====
+bot.run(DISCORD_TOKEN)
