@@ -46,4 +46,4 @@ creds = service_account.Credentials.from_service_account_info(
 drive_service = build("drive", "v3", credentials=creds)
 
 # ====================== HELPER: Ambil Info Game dari Steam ======================
-async def fetch_steam_info(appid: str
+async def fetch_steam_info(appid: str)
