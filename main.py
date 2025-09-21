@@ -110,10 +110,11 @@ async def gen(ctx, appid: str):
 
     # Embed
     embed = discord.Embed(
-        title=f"✅ Manifest Generated: {steam_info['name'] if steam_info else filename}",
-        description=f"Successfully generated manifest files for **{steam_info['name'] if steam_info else filename}**",
+        title=f"✅ Manifest Generated: {steam_info['name']} ({appid})" if steam_info else f"✅ Manifest Generated: {filename}",
+        description=f"Successfully generated manifest files for **{steam_info['name']} ({appid})**" if steam_info else f"Successfully generated manifest files for **{filename}**",
         color=discord.Color.green()
     )
+
     if steam_info:
         embed.add_field(name="Links", value=f"[Steam Store]({steam_info['steam_url']}) | [SteamDB]({steam_info['steamdb_url']})", inline=False)
     embed.add_field(name="Manifest Status", value=f"✅ All {manifest_count} manifests are up to date", inline=False)
