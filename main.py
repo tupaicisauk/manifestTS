@@ -45,8 +45,9 @@ creds = service_account.Credentials.from_service_account_info(
 )
 drive_service = build("drive", "v3", credentials=creds)
 
-# ====== CACHE UNTUK CEK FILE BARU ======
+# ====== CACHE & FLAG ======
 known_files = set()
+ENABLE_UPLOAD_WATCH = False  # Default: notif mati saat start
 
 # ====== FETCH DATA DARI STEAM ======
 async def fetch_steam_info(appid: str):
@@ -92,7 +93,7 @@ def download_file(file_id, file_name):
 # ====== SLASH COMMAND /gen ======
 @tree.command(name="gen", description="Generate manifest dari Google Drive dengan AppID")
 async def gen(interaction: discord.Interaction, appid: str):
-    await interaction.response.defer()  # kasih waktu bot mikir
+    await interaction.response.defer()
 
     try:
         query = f"name contains '{appid}.zip' and '{FOLDER_ID}' in parents"
@@ -113,8 +114,6 @@ async def gen(interaction: discord.Interaction, appid: str):
         created, modified = file["createdTime"], file["modifiedTime"]
 
         info = await fetch_steam_info(appid)
-
-        # Download file dari Google Drive
         filepath = download_file(file_id, file_name)
 
         embed = discord.Embed(
@@ -140,6 +139,9 @@ async def gen(interaction: discord.Interaction, appid: str):
 @tasks.loop(minutes=1)
 async def check_new_files():
     global known_files
+    if not ENABLE_UPLOAD_WATCH:
+        return  # skip kalau notif dimatikan
+
     try:
         results = drive_service.files().list(
             q=f"'{FOLDER_ID}' in parents",
@@ -174,6 +176,19 @@ async def check_new_files():
 
     except Exception as e:
         print(f"❌ Error di check_new_files: {e}")
+
+# ====== SLASH COMMAND UNTUK NOTIF ON/OFF ======
+@tree.command(name="notif", description="Nyalakan atau matikan auto-notif file baru")
+async def notif(interaction: discord.Interaction, mode: str):
+    global ENABLE_UPLOAD_WATCH
+    if mode.lower() == "on":
+        ENABLE_UPLOAD_WATCH = True
+        await interaction.response.send_message("✅ Auto-notif **diaktifkan**.")
+    elif mode.lower() == "off":
+        ENABLE_UPLOAD_WATCH = False
+        await interaction.response.send_message("🛑 Auto-notif **dimatikan**.")
+    else:
+        await interaction.response.send_message("❌ Gunakan `/notif on` atau `/notif off`.")
 
 # ====== ON READY ======
 @bot.event
