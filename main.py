@@ -33,9 +33,6 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
 FOLDER_ID = os.getenv("FOLDER_ID")
 
-if not DISCORD_TOKEN or not DISCORD_CHANNEL_ID or not FOLDER_ID:
-    raise ValueError("❌ Pastikan DISCORD_TOKEN, DISCORD_CHANNEL_ID, dan FOLDER_ID sudah di-set!")
-
 # ===== GOOGLE DRIVE API =====
 def get_drive_service():
     creds_dict = eval(os.getenv("GDRIVE_CREDENTIALS"))
@@ -48,13 +45,11 @@ async def fetch_file_from_drive(filename: str):
     service = get_drive_service()
     results = service.files().list(
         q=f"'{FOLDER_ID}' in parents and name='{filename}'",
-        fields="files(id, name, createdTime, modifiedTime, mimeType)"
+        fields="files(id, name, createdTime, modifiedTime)"
     ).execute()
-
     items = results.get("files", [])
     if not items:
         return None, None, None, None
-
     file_id = items[0]["id"]
     request = service.files().get_media(fileId=file_id)
     data = io.BytesIO(request.execute())
@@ -62,7 +57,7 @@ async def fetch_file_from_drive(filename: str):
 
 # ===== STEAM API =====
 async def fetch_steam_info(appid: str):
-    url = f"https://store.steampowered.com/api/appdetails?appids={appid}"
+    url = f"https://store.steampowered.com/api/appdetails?appids={appid}&cc=us&l=en"
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
             data = await resp.json()
@@ -70,27 +65,25 @@ async def fetch_steam_info(appid: str):
                 return None
             game_data = data[str(appid)]["data"]
             return {
-                "name": game_data["name"],
+                "name": game_data.get("name", f"App {appid}"),
                 "steam_url": f"https://store.steampowered.com/app/{appid}",
                 "steamdb_url": f"https://steamdb.info/app/{appid}/",
-                "header_img": game_data["header_image"]
+                "header_img": game_data.get("header_image"),
+                "dlc": game_data.get("dlc", [])
             }
 
-# ===== DLC PARSER (cek file .lua) =====
+# ===== DLC PARSER =====
 def parse_dlc_from_zip(buffer: io.BytesIO):
     buffer.seek(0)
     z = zipfile.ZipFile(buffer)
     dlc_list = []
-
     for fname in z.namelist():
         if fname.endswith(".lua"):
             with z.open(fname) as f:
                 content = f.read().decode(errors="ignore")
-                # Cari pola appid atau DLC
-                found = re.findall(r"\b\d{6,}\b", content)  # cari angka mirip AppID
+                found = re.findall(r"\b\d{6,}\b", content)
                 dlc_list.extend(found)
-
-    return list(set(dlc_list))  # unik
+    return list(set(dlc_list))
 
 # ===== DISCORD COMMAND =====
 @bot.hybrid_command(name="gen", description="Generate manifest dari Google Drive (contoh: /gen 1086940)")
@@ -104,36 +97,35 @@ async def gen(ctx, appid: str):
         await ctx.reply(f"❌ Manifest {filename} tidak ditemukan di Google Drive.")
         return
 
-    # === Cek DLC dari file .lua
-    dlc_list = parse_dlc_from_zip(buffer)
-    total_dlc = len(dlc_list)
-
-    # === Ambil info Steam
+    local_dlc = parse_dlc_from_zip(buffer)
     steam_info = await fetch_steam_info(appid)
+    steam_dlc = steam_info["dlc"] if steam_info and "dlc" in steam_info else []
 
+    # DLC status
+    if steam_dlc:
+        existing = len([d for d in local_dlc if d in steam_dlc])
+        missing = len([d for d in steam_dlc if d not in local_dlc])
+        total_dlc = len(steam_dlc)
+        completion = round((existing / total_dlc) * 100, 2) if total_dlc > 0 else "?"
+        dlc_text = f"✅ Total DLC: {total_dlc}\nExisting: {existing} | Missing: {missing}\nCompletion: {completion}%"
+    else:
+        dlc_text = "ℹ️ No DLC found for this game"
+
+    # Embed
     embed = discord.Embed(
         title=f"✅ Manifest Generated: {steam_info['name'] if steam_info else filename}",
-        description=f"Successfully generated manifest files for **{steam_info['name'] if steam_info else filename}** ({appid})",
+        description=f"Successfully generated manifest files for **{steam_info['name'] if steam_info else filename}**",
         color=discord.Color.green()
     )
-
     if steam_info:
         embed.add_field(name="Links", value=f"[Steam Store]({steam_info['steam_url']}) | [SteamDB]({steam_info['steamdb_url']})", inline=False)
-
-    embed.add_field(name="Manifest Status", value="✅ Manifest ditemukan di Google Drive", inline=False)
-    embed.add_field(
-        name="DLC Status",
-        value=f"✅ Total DLC: {total_dlc}\nDetected AppIDs: {', '.join(dlc_list) if dlc_list else 'Tidak ada DLC'}",
-        inline=False
-    )
-    embed.add_field(name="Google Drive", value=f"**Upload date:** {created[:10]}\n**Updated date:** {modified[:10]}", inline=False)
-
+    embed.add_field(name="Manifest Status", value="✅ All manifests are up to date", inline=False)
+    embed.add_field(name="DLC Status", value=dlc_text, inline=False)
     if steam_info and steam_info.get("header_img"):
         embed.set_image(url=steam_info["header_img"])
 
     buffer.seek(0)
     file = discord.File(buffer, filename=filename)
-
     await ctx.reply(embed=embed, file=file)
 
 # ===== START =====
