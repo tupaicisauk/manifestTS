@@ -1,12 +1,14 @@
 import os
+import json
 import discord
-from discord.ext import commands, tasks
+from discord.ext import tasks
+from discord import app_commands
 from flask import Flask
 from threading import Thread
-from googleapiclient.discovery import build
 from google.oauth2 import service_account
-import datetime
+from googleapiclient.discovery import build
 import aiohttp
+import requests
 
 # ====== KEEP ALIVE SERVER ======
 app = Flask(__name__)
@@ -24,36 +26,74 @@ def keep_alive():
 
 # ====== DISCORD BOT ======
 intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="/", intents=intents)
+bot = discord.Client(intents=intents)
+tree = app_commands.CommandTree(bot)
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
 FOLDER_ID = os.getenv("FOLDER_ID")
-GDRIVE_CREDENTIALS = os.getenv("GDRIVE_CREDENTIALS")
-
-if not DISCORD_TOKEN or not DISCORD_CHANNEL_ID or not FOLDER_ID or not GDRIVE_CREDENTIALS:
-    raise ValueError("❌ Missing environment variables!")
 
 # ====== GOOGLE DRIVE SETUP ======
+SCOPES = ["https://www.googleapis.com/auth/drive"]
+SERVICE_ACCOUNT_INFO = os.getenv("GDRIVE_CREDENTIALS")
+
+if not SERVICE_ACCOUNT_INFO:
+    raise ValueError("❌ GDRIVE_CREDENTIALS tidak ditemukan di environment variable!")
+
 creds = service_account.Credentials.from_service_account_info(
-    eval(GDRIVE_CREDENTIALS),
-    scopes=["https://www.googleapis.com/auth/drive"]
+    json.loads(SERVICE_ACCOUNT_INFO), scopes=SCOPES
 )
-drive_service = build('drive', 'v3', credentials=creds)
+drive_service = build("drive", "v3", credentials=creds)
 
-# cache untuk file terbaru
-known_files = {}
+# ====== CACHE UNTUK CEK FILE BARU ======
+known_files = set()
 
-# ====== HELPER GET GAME INFO (STEAMDB) ======
-async def fetch_steam_info(appid):
-    steamdb_url = f"https://steamdb.info/app/{appid}/"
-    steam_url = f"https://store.steampowered.com/app/{appid}/"
-    return {"steamdb": steamdb_url, "steam": steam_url}
+# ====== FETCH DATA DARI STEAM ======
+async def fetch_steam_info(appid: str):
+    try:
+        async with aiohttp.ClientSession() as session:
+            store_url = f"https://store.steampowered.com/api/appdetails?appids={appid}"
+            async with session.get(store_url) as resp:
+                data = await resp.json()
+                if data[str(appid)]["success"]:
+                    game_name = data[str(appid)]["data"]["name"]
+                    header_img = data[str(appid)]["data"]["header_image"]
+                else:
+                    game_name, header_img = f"AppID {appid}", None
+        return {
+            "name": game_name,
+            "steam": f"https://store.steampowered.com/app/{appid}",
+            "steamdb": f"https://steamdb.info/app/{appid}",
+            "header": header_img
+        }
+    except:
+        return {
+            "name": f"AppID {appid}",
+            "steam": f"https://store.steampowered.com/app/{appid}",
+            "steamdb": f"https://steamdb.info/app/{appid}",
+            "header": None
+        }
 
-# ====== /gen COMMAND ======
-@bot.command()
-async def gen(ctx, appid: str):
+# ====== DOWNLOAD FILE DARI GOOGLE DRIVE ======
+def download_file(file_id, file_name):
+    request = drive_service.files().get_media(fileId=file_id)
+    filepath = f"/tmp/{file_name}"
+    with open(filepath, "wb") as f:
+        downloader = requests.get(
+            f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
+            headers={"Authorization": f"Bearer {creds.token}"},
+            stream=True
+        )
+        for chunk in downloader.iter_content(chunk_size=4096):
+            if chunk:
+                f.write(chunk)
+    return filepath
+
+# ====== SLASH COMMAND /gen ======
+@tree.command(name="gen", description="Generate manifest dari Google Drive dengan AppID")
+async def gen(interaction: discord.Interaction, appid: str):
+    await interaction.response.defer()  # kasih waktu bot mikir
+
     try:
         query = f"name contains '{appid}.zip' and '{FOLDER_ID}' in parents"
         results = drive_service.files().list(
@@ -63,7 +103,9 @@ async def gen(ctx, appid: str):
         items = results.get("files", [])
 
         if not items:
-            await ctx.send(f"❌ File untuk AppID {appid} tidak ditemukan di Google Drive.")
+            await interaction.followup.send(
+                f"❌ File untuk AppID {appid} tidak ditemukan di Google Drive."
+            )
             return
 
         file = items[0]
@@ -72,187 +114,74 @@ async def gen(ctx, appid: str):
 
         info = await fetch_steam_info(appid)
 
+        # Download file dari Google Drive
+        filepath = download_file(file_id, file_name)
+
         embed = discord.Embed(
-            title=f"✅ Manifest Generated: {file_name.replace('.zip','')}",
-            description=f"Successfully generated manifest files for **{file_name.replace('.zip','')}** ({appid})",
+            title=f"✅ Manifest Generated: {info['name']}",
+            description=f"Successfully generated manifest files for **{info['name']}** ({appid})",
             color=discord.Color.green()
         )
         embed.add_field(name="Links", value=f"[Steam Store]({info['steam']}) | [SteamDB]({info['steamdb']})", inline=False)
         embed.add_field(name="Manifest Status", value="✅ All manifests are up to date", inline=False)
         embed.add_field(name="Google Drive", value=f"Upload date: {created[:10]} • Updated date: {modified[:10]}", inline=False)
+        if info['header']:
+            embed.set_image(url=info['header'])
         embed.set_footer(text="Generated by TechStation Manifest")
 
-        # download file dari drive
-        request = drive_service.files().get_media(fileId=file_id)
-        file_path = f"/tmp/{file_name}"
-        with open(file_path, "wb") as f:
-            downloader = drive_service._http.request("GET", request.uri)
-            f.write(downloader.data)
-
-        await ctx.send(file=discord.File(file_path), embed=embed)
+        await interaction.followup.send(embed=embed, file=discord.File(filepath, file_name))
 
     except Exception as e:
-        await ctx.send(f"❌ Error saat generate manifest: {str(e)}")
+        await interaction.followup.send(
+            f"❌ Error saat generate manifest: {str(e)}"
+        )
 
-# ====== AUTO CHECK NEW FILES ======
+# ====== BACKGROUND TASK CEK FILE BARU ======
 @tasks.loop(minutes=1)
 async def check_new_files():
+    global known_files
     try:
-        global known_files
         results = drive_service.files().list(
-            q=f"'{FOLDER_ID}' in parents and mimeType='application/zip'",
-            fields="files(id, name, createdTime, modifiedTime, size)"
+            q=f"'{FOLDER_ID}' in parents",
+            fields="files(id, name, createdTime, modifiedTime, mimeType)"
         ).execute()
-        files = results.get("files", [])
+        items = results.get("files", [])
 
-        channel = bot.get_channel(DISCORD_CHANNEL_ID)
-        for file in files:
-            file_id, file_name = file["id"], file["name"]
-            if file_id not in known_files:
-                known_files[file_id] = file
-                appid = file_name.replace(".zip", "")
+        new_files = []
+        for f in items:
+            if f["id"] not in known_files:
+                known_files.add(f["id"])
+                new_files.append(f)
 
+        if new_files:
+            channel = bot.get_channel(DISCORD_CHANNEL_ID)
+            for file in new_files:
+                appid = file["name"].replace(".zip", "")
                 info = await fetch_steam_info(appid)
+
                 embed = discord.Embed(
-                    title=f"🆕 {file_name.replace('.zip','')} Added",
-                    description=f"New manifest file detected for **{file_name.replace('.zip','')}** ({appid})",
+                    title=f"🆕 New Game Added: {info['name']}",
+                    description=f"A new manifest has been uploaded for **{info['name']}** ({appid})",
                     color=discord.Color.blue()
                 )
                 embed.add_field(name="Links", value=f"[Steam Store]({info['steam']}) | [SteamDB]({info['steamdb']})", inline=False)
                 embed.add_field(name="Upload Info", value=f"Upload date: {file['createdTime'][:10]} • Updated date: {file['modifiedTime'][:10]}", inline=False)
-                embed.set_footer(text="Generated by TechStation Manifest")
+                if info['header']:
+                    embed.set_image(url=info['header'])
+                embed.set_footer(text="Reported by TechStation Manifest")
 
                 await channel.send(embed=embed)
 
     except Exception as e:
-        print(f"Error auto-check: {e}")
+        print(f"❌ Error di check_new_files: {e}")
 
+# ====== ON READY ======
 @bot.event
 async def on_ready():
+    await tree.sync()
     print(f"✅ Bot {bot.user} sudah online dengan slash command!")
     check_new_files.start()
 
-# ====== START ======
-keep_alive()
-bot.run(DISCORD_TOKEN)
-import os
-import discord
-from discord.ext import commands, tasks
-from flask import Flask
-from threading import Thread
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-import aiohttp
-import asyncio
-from datetime import datetime
-
-# ================== KEEP ALIVE SERVER ==================
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "Bot is alive!"
-
-def run():
-    app.run(host="0.0.0.0", port=8080)
-
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
-
-# ================== DISCORD BOT SETUP ==================
-intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="/", intents=intents)
-
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
-FOLDER_ID = os.getenv("FOLDER_ID")
-GDRIVE_CREDENTIALS = os.getenv("GDRIVE_CREDENTIALS")
-
-if not DISCORD_TOKEN or not DISCORD_CHANNEL_ID or not FOLDER_ID or not GDRIVE_CREDENTIALS:
-    raise ValueError("❌ Pastikan semua environment variable sudah diset (DISCORD_TOKEN, DISCORD_CHANNEL_ID, FOLDER_ID, GDRIVE_CREDENTIALS)")
-
-# ================== GOOGLE DRIVE SERVICE ==================
-import json
-creds_dict = json.loads(GDRIVE_CREDENTIALS)
-creds = service_account.Credentials.from_service_account_info(
-    creds_dict,
-    scopes=["https://www.googleapis.com/auth/drive"]
-)
-drive_service = build("drive", "v3", credentials=creds)
-
-last_seen_files = set()
-
-# ================== FETCH STEAM DATA ==================
-async def fetch_steam_data(appid: str):
-    url = f"https://store.steampowered.com/api/appdetails?appids={appid}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            data = await resp.json()
-            if data and data.get(appid, {}).get("success"):
-                game_data = data[appid]["data"]
-                return {
-                    "name": game_data.get("name", "Unknown"),
-                    "release_date": game_data.get("release_date", {}).get("date", "Unknown"),
-                    "developers": ", ".join(game_data.get("developers", ["Unknown"])),
-                    "header_image": game_data.get("header_image", None),
-                }
-    return None
-
-# ================== CHECK NEW FILES ==================
-@tasks.loop(minutes=2)
-async def check_new_files():
-    global last_seen_files
-    results = drive_service.files().list(
-        q=f"'{FOLDER_ID}' in parents and mimeType='application/zip'",
-        fields="files(id, name, createdTime, modifiedTime)",
-        orderBy="createdTime desc"
-    ).execute()
-
-    files = results.get("files", [])
-    new_files = [f for f in files if f["id"] not in last_seen_files]
-
-    for file in new_files:
-        last_seen_files.add(file["id"])
-
-        # Extract appid from filename (e.g. 123456.zip → 123456)
-        appid = file["name"].replace(".zip", "")
-        steam_data = await fetch_steam_data(appid)
-
-        # Build embed
-        embed = discord.Embed(
-            title=f"{steam_data['name']} ({appid}) Added" if steam_data else f"Game Added ({appid})",
-            description=f"Successfully generated manifest files for **{steam_data['name']}** ({appid})" if steam_data else f"Manifest generated for AppID {appid}",
-            color=discord.Color.green()
-        )
-
-        embed.add_field(
-            name="Links",
-            value=f"[Steam Store](https://store.steampowered.com/app/{appid}) | [SteamDB](https://steamdb.info/app/{appid})",
-            inline=False
-        )
-
-        if steam_data:
-            embed.add_field(name="Release Date", value=steam_data["release_date"], inline=True)
-            embed.add_field(name="Developer", value=steam_data["developers"], inline=True)
-
-        embed.add_field(name="Upload Date", value=file["createdTime"][:10], inline=True)
-        embed.add_field(name="Updated Date", value=file["modifiedTime"][:10], inline=True)
-
-        if steam_data and steam_data["header_image"]:
-            embed.set_image(url=steam_data["header_image"])
-
-        embed.set_footer(text="Generated by TechStation Manifest")
-
-        channel = bot.get_channel(DISCORD_CHANNEL_ID)
-        await channel.send(embed=embed)
-
-# ================== BOT EVENTS ==================
-@bot.event
-async def on_ready():
-    print(f"✅ Bot {bot.user} sudah online!")
-    check_new_files.start()
-
-# ================== START ==================
+# ====== START BOT ======
 keep_alive()
 bot.run(DISCORD_TOKEN)
