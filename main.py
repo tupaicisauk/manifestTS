@@ -1,16 +1,15 @@
 import os
-import io
-import zipfile
-import re
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from flask import Flask
 from threading import Thread
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 import aiohttp
+import asyncio
+from datetime import datetime
 
-# ===== KEEP ALIVE =====
+# ================== KEEP ALIVE SERVER ==================
 app = Flask(__name__)
 
 @app.route('/')
@@ -24,116 +23,99 @@ def keep_alive():
     t = Thread(target=run)
     t.start()
 
-# ===== DISCORD BOT =====
+# ================== DISCORD BOT SETUP ==================
 intents = discord.Intents.default()
-intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
 FOLDER_ID = os.getenv("FOLDER_ID")
+GDRIVE_CREDENTIALS = os.getenv("GDRIVE_CREDENTIALS")
 
-# ===== GOOGLE DRIVE API =====
-def get_drive_service():
-    creds_dict = eval(os.getenv("GDRIVE_CREDENTIALS"))
-    creds = service_account.Credentials.from_service_account_info(
-        creds_dict, scopes=["https://www.googleapis.com/auth/drive"]
-    )
-    return build("drive", "v3", credentials=creds)
+if not DISCORD_TOKEN or not DISCORD_CHANNEL_ID or not FOLDER_ID or not GDRIVE_CREDENTIALS:
+    raise ValueError("❌ Pastikan semua environment variable sudah diset (DISCORD_TOKEN, DISCORD_CHANNEL_ID, FOLDER_ID, GDRIVE_CREDENTIALS)")
 
-async def fetch_file_from_drive(filename: str):
-    service = get_drive_service()
-    results = service.files().list(
-        q=f"'{FOLDER_ID}' in parents and name='{filename}'",
-        fields="files(id, name, createdTime, modifiedTime)"
-    ).execute()
-    items = results.get("files", [])
-    if not items:
-        return None, None, None, None
-    file_id = items[0]["id"]
-    request = service.files().get_media(fileId=file_id)
-    data = io.BytesIO(request.execute())
-    return data, items[0]["name"], items[0]["createdTime"], items[0]["modifiedTime"]
+# ================== GOOGLE DRIVE SERVICE ==================
+import json
+creds_dict = json.loads(GDRIVE_CREDENTIALS)
+creds = service_account.Credentials.from_service_account_info(
+    creds_dict,
+    scopes=["https://www.googleapis.com/auth/drive"]
+)
+drive_service = build("drive", "v3", credentials=creds)
 
-# ===== STEAM API =====
-async def fetch_steam_info(appid: str):
-    url = f"https://store.steampowered.com/api/appdetails?appids={appid}&cc=us&l=en"
+last_seen_files = set()
+
+# ================== FETCH STEAM DATA ==================
+async def fetch_steam_data(appid: str):
+    url = f"https://store.steampowered.com/api/appdetails?appids={appid}"
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
             data = await resp.json()
-            if not data or not data[str(appid)]["success"]:
-                return None
-            game_data = data[str(appid)]["data"]
-            return {
-                "name": game_data.get("name", f"App {appid}"),
-                "steam_url": f"https://store.steampowered.com/app/{appid}",
-                "steamdb_url": f"https://steamdb.info/app/{appid}/",
-                "header_img": game_data.get("header_image"),
-                "dlc": game_data.get("dlc", [])
-            }
+            if data and data.get(appid, {}).get("success"):
+                game_data = data[appid]["data"]
+                return {
+                    "name": game_data.get("name", "Unknown"),
+                    "release_date": game_data.get("release_date", {}).get("date", "Unknown"),
+                    "developers": ", ".join(game_data.get("developers", ["Unknown"])),
+                    "header_image": game_data.get("header_image", None),
+                }
+    return None
 
-# ===== DLC PARSER =====
-def parse_dlc_from_zip(buffer: io.BytesIO):
-    buffer.seek(0)
-    z = zipfile.ZipFile(buffer)
-    dlc_list = []
-    for fname in z.namelist():
-        if fname.endswith(".lua"):
-            with z.open(fname) as f:
-                content = f.read().decode(errors="ignore")
-                found = re.findall(r"\b\d{6,}\b", content)
-                dlc_list.extend(found)
-    return list(set(dlc_list))
+# ================== CHECK NEW FILES ==================
+@tasks.loop(minutes=2)
+async def check_new_files():
+    global last_seen_files
+    results = drive_service.files().list(
+        q=f"'{FOLDER_ID}' in parents and mimeType='application/zip'",
+        fields="files(id, name, createdTime, modifiedTime)",
+        orderBy="createdTime desc"
+    ).execute()
 
-# ===== DISCORD COMMAND =====
-@bot.hybrid_command(name="gen", description="Generate manifest dari Google Drive (contoh: /gen 1086940)")
-async def gen(ctx, appid: str):
-    await ctx.defer()
+    files = results.get("files", [])
+    new_files = [f for f in files if f["id"] not in last_seen_files]
 
-    filename = f"{appid}.zip"
-    buffer, name, created, modified = await fetch_file_from_drive(filename)
+    for file in new_files:
+        last_seen_files.add(file["id"])
 
-    if not buffer:
-        await ctx.reply(f"❌ Manifest {filename} tidak ditemukan di Google Drive.")
-        return
+        # Extract appid from filename (e.g. 123456.zip → 123456)
+        appid = file["name"].replace(".zip", "")
+        steam_data = await fetch_steam_data(appid)
 
-    local_dlc = parse_dlc_from_zip(buffer)
-    steam_info = await fetch_steam_info(appid)
+        # Build embed
+        embed = discord.Embed(
+            title=f"{steam_data['name']} ({appid}) Added" if steam_data else f"Game Added ({appid})",
+            description=f"Successfully generated manifest files for **{steam_data['name']}** ({appid})" if steam_data else f"Manifest generated for AppID {appid}",
+            color=discord.Color.green()
+        )
 
-    # Manifest count (jumlah file dalam ZIP)
-    buffer.seek(0)
-    z = zipfile.ZipFile(buffer)
-    manifest_count = len(z.namelist())
+        embed.add_field(
+            name="Links",
+            value=f"[Steam Store](https://store.steampowered.com/app/{appid}) | [SteamDB](https://steamdb.info/app/{appid})",
+            inline=False
+        )
 
-    # DLC status (hanya total)
-    dlc_text = f"✅ Total DLC: {len(steam_info['dlc'])}" if steam_info and steam_info.get("dlc") else "ℹ️ No DLC found for this game"
+        if steam_data:
+            embed.add_field(name="Release Date", value=steam_data["release_date"], inline=True)
+            embed.add_field(name="Developer", value=steam_data["developers"], inline=True)
 
-    # Embed
-    embed = discord.Embed(
-        title=f"✅ Manifest Generated: {steam_info['name']} ({appid})" if steam_info else f"✅ Manifest Generated: {filename}",
-        description=f"Successfully generated manifest files for **{steam_info['name']} ({appid})**" if steam_info else f"Successfully generated manifest files for **{filename}**",
-        color=discord.Color.green()
-    )
+        embed.add_field(name="Upload Date", value=file["createdTime"][:10], inline=True)
+        embed.add_field(name="Updated Date", value=file["modifiedTime"][:10], inline=True)
 
-    if steam_info:
-        embed.add_field(name="Links", value=f"[Steam Store]({steam_info['steam_url']}) | [SteamDB]({steam_info['steamdb_url']})", inline=False)
-    embed.add_field(name="Manifest Status", value=f"✅ All {manifest_count} manifests are up to date", inline=False)
-    embed.add_field(name="DLC Status", value=dlc_text, inline=False)
-    if steam_info and steam_info.get("header_img"):
-        embed.set_image(url=steam_info["header_img"])
+        if steam_data and steam_data["header_image"]:
+            embed.set_image(url=steam_data["header_image"])
 
-    # Branding TechStation di footer
-    embed.set_footer(text="Generated by TechStation Manifest")
+        embed.set_footer(text="Generated by TechStation Manifest")
 
-    buffer.seek(0)
-    file = discord.File(buffer, filename=filename)
-    await ctx.reply(embed=embed, file=file)
+        channel = bot.get_channel(DISCORD_CHANNEL_ID)
+        await channel.send(embed=embed)
 
-# ===== START =====
+# ================== BOT EVENTS ==================
 @bot.event
 async def on_ready():
-    synced = await bot.tree.sync()
-    print(f"✅ Bot {bot.user} sudah online! Slash commands: {len(synced)}")
+    print(f"✅ Bot {bot.user} sudah online!")
+    check_new_files.start()
 
+# ================== START ==================
 keep_alive()
 bot.run(DISCORD_TOKEN)
