@@ -101,13 +101,24 @@ async def gen(ctx, appid: str):
     steam_info = await fetch_steam_info(appid)
     steam_dlc = steam_info["dlc"] if steam_info and "dlc" in steam_info else []
 
+    # Manifest count (jumlah file dalam ZIP)
+    buffer.seek(0)
+    z = zipfile.ZipFile(buffer)
+    manifest_count = len(z.namelist())
+
     # DLC status
     if steam_dlc:
+        valid_dlc = [d for d in steam_dlc if d not in ["artbook", "music", "tools"]]
         existing = len([d for d in local_dlc if d in steam_dlc])
         missing = len([d for d in steam_dlc if d not in local_dlc])
         total_dlc = len(steam_dlc)
         completion = round((existing / total_dlc) * 100, 2) if total_dlc > 0 else "?"
-        dlc_text = f"✅ Total DLC: {total_dlc}\nExisting: {existing} | Missing: {missing}\nCompletion: {completion}%"
+        dlc_text = (
+            f"✅ Total DLC: {total_dlc}\n"
+            f"Valid DLC: {len(valid_dlc)} (excluding artbooks/music/tools)\n"
+            f"Existing: {existing} | Missing: {missing}\n"
+            f"Completion: {completion}%"
+        )
     else:
         dlc_text = "ℹ️ No DLC found for this game"
 
@@ -119,7 +130,7 @@ async def gen(ctx, appid: str):
     )
     if steam_info:
         embed.add_field(name="Links", value=f"[Steam Store]({steam_info['steam_url']}) | [SteamDB]({steam_info['steamdb_url']})", inline=False)
-    embed.add_field(name="Manifest Status", value="✅ All manifests are up to date", inline=False)
+    embed.add_field(name="Manifest Status", value=f"✅ All {manifest_count} manifests are up to date", inline=False)
     embed.add_field(name="DLC Status", value=dlc_text, inline=False)
     if steam_info and steam_info.get("header_img"):
         embed.set_image(url=steam_info["header_img"])
