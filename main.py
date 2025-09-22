@@ -53,7 +53,7 @@ def initialize_known_files():
     global known_files
     try:
         results = drive_service.files().list(
-            q=f"'{FOLDER_ID}' in parents",
+            q=f"'{FOLDER_ID}' in parents and trashed=false",
             fields="files(id, name, modifiedTime)"
         ).execute()
         items = results.get("files", [])
@@ -94,7 +94,7 @@ async def gen(interaction: discord.Interaction, appid: str):
     await interaction.response.defer()
 
     try:
-        query = f"name contains '{appid}.zip' and '{FOLDER_ID}' in parents"
+        query = f"name contains '{appid}.zip' and '{FOLDER_ID}' in parents and trashed=false"
         results = drive_service.files().list(
             q=query,
             fields="files(id, name, createdTime, modifiedTime)"
@@ -136,7 +136,7 @@ async def check_new_files():
 
     try:
         results = drive_service.files().list(
-            q=f"'{FOLDER_ID}' in parents",
+            q=f"'{FOLDER_ID}' in parents and trashed=false",
             fields="files(id, name, createdTime, modifiedTime)"
         ).execute()
         items = results.get("files", [])
@@ -145,11 +145,13 @@ async def check_new_files():
         for f in items:
             fname, fid, mtime = f["name"], f["id"], f["modifiedTime"]
 
+            # ambil AppID dengan lebih aman
+            appid = os.path.splitext(fname)[0]
+
             if fname in known_files:
                 # CASE 1: ID beda -> updated
                 if known_files[fname]["id"] != fid:
                     known_files[fname] = {"id": fid, "mtime": mtime}
-                    appid = fname.replace(".zip", "")
                     info = await fetch_steam_info(appid)
                     embed = discord.Embed(
                         title=f"♻️ Game Updated: {info['name']}",
@@ -162,7 +164,6 @@ async def check_new_files():
                 # CASE 2: ID sama tapi modifiedTime berubah -> updated
                 elif known_files[fname]["mtime"] != mtime:
                     known_files[fname]["mtime"] = mtime
-                    appid = fname.replace(".zip", "")
                     info = await fetch_steam_info(appid)
                     embed = discord.Embed(
                         title=f"♻️ Game Updated (Replaced Content): {info['name']}",
@@ -175,7 +176,6 @@ async def check_new_files():
             else:
                 # CASE 3: file baru
                 known_files[fname] = {"id": fid, "mtime": mtime}
-                appid = fname.replace(".zip", "")
                 info = await fetch_steam_info(appid)
                 embed = discord.Embed(
                     title=f"🆕 New Game Added: {info['name']}",
@@ -186,7 +186,8 @@ async def check_new_files():
                 await channel.send(embed=embed)
 
     except Exception as e:
-        print(f"❌ Error di check_new_files: {e}")
+        ENABLE_UPLOAD_WATCH = False
+        print(f"❌ Error di check_new_files, notif otomatis dimatikan: {e}")
 
 # ====== SLASH COMMAND NOTIF ======
 @tree.command(name="notif", description="Aktifkan atau matikan auto-notif upload/update")
