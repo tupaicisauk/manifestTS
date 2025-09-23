@@ -10,10 +10,12 @@ from googleapiclient.discovery import build
 import aiohttp
 import requests
 
-# ====== KEEP ALIVE SERVER ======
+# =========================
+# KEEP-ALIVE (optional)
+# =========================
 app = Flask(__name__)
 
-@app.route('/')
+@app.route("/")
 def home():
     return "Bot is alive!"
 
@@ -21,22 +23,25 @@ def run():
     app.run(host="0.0.0.0", port=8080)
 
 def keep_alive():
-    t = Thread(target=run)
+    t = Thread(target=run, daemon=True)
     t.start()
 
-# ====== DISCORD BOT ======
+# =========================
+# DISCORD SETUP
+# =========================
 intents = discord.Intents.default()
 intents.guilds = True
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-FOLDER_ID = os.getenv("FOLDER_ID")
+FOLDER_ID = os.getenv("FOLDER_ID")  # folder di My Drive yang dipakai bot
 
-# ====== GOOGLE DRIVE SETUP ======
+# =========================
+# GOOGLE DRIVE (Service Account)
+# =========================
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 SERVICE_ACCOUNT_INFO = os.getenv("GDRIVE_CREDENTIALS")
-
 if not SERVICE_ACCOUNT_INFO:
     raise ValueError("❌ GDRIVE_CREDENTIALS tidak ditemukan di environment variable!")
 
@@ -45,7 +50,9 @@ creds = service_account.Credentials.from_service_account_info(
 )
 drive_service = build("drive", "v3", credentials=creds)
 
-# ====== CONFIG PERSISTENT ======
+# =========================
+# CONFIG PERSISTENCE (per-guild)
+# =========================
 CONFIG_FILE = "bot_config.json"
 
 def load_config():
@@ -54,25 +61,27 @@ def load_config():
             return json.load(f)
     return {}
 
-def save_config(config):
+def save_config(cfg):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=4)
+        json.dump(cfg, f, indent=2)
 
-config = load_config()
+config = load_config()   # { "guild_id_str": {"upload_channel": int|None, "update_channel": int|None} }
 
-def ensure_guild_config(guild_id):
+def ensure_guild_config(guild_id: int):
     gid = str(guild_id)
     if gid not in config:
         config[gid] = {"upload_channel": None, "update_channel": None}
         save_config(config)
 
-# ====== CACHE ======
-# { filename: {"id": id, "mtime": modifiedTime, "size": size} }
+# =========================
+# CACHE DRIVE (anti spam)
+# =========================
+# { filename: {"id": "...", "mtime": "...", "size": "12345"} }
 known_files = {}
 ENABLE_UPLOAD_WATCH = False
 
-# ====== INIT CACHE ======
 def initialize_known_files():
+    """Seed cache dari isi folder Drive agar gak spam waktu notif dinyalakan."""
     global known_files
     try:
         results = drive_service.files().list(
@@ -81,41 +90,53 @@ def initialize_known_files():
         ).execute()
         items = results.get("files", [])
         known_files = {
-            f["name"]: {"id": f["id"], "mtime": f["modifiedTime"], "size": f.get("size", "0")}
+            f["name"]: {
+                "id": f["id"],
+                "mtime": f.get("modifiedTime", ""),
+                "size": f.get("size", "0")
+            }
             for f in items
         }
-        print(f"🔹 Initialized {len(known_files)} file ke cache.")
+        print(f"🔹 Initialized cache: {len(known_files)} file.")
     except Exception as e:
         print(f"❌ Error init known files: {e}")
 
-# ====== FETCH DATA DARI STEAM ======
+# =========================
+# STEAM INFO
+# =========================
 async def fetch_steam_info(appid: str):
     try:
         async with aiohttp.ClientSession() as session:
-            store_url = f"https://store.steampowered.com/api/appdetails?appids={appid}"
-            async with session.get(store_url) as resp:
+            url = f"https://store.steampowered.com/api/appdetails?appids={appid}"
+            async with session.get(url) as resp:
                 data = await resp.json()
-                if data[str(appid)]["success"]:
+                if data.get(str(appid), {}).get("success"):
                     g = data[str(appid)]["data"]
                     return {
-                        "name": g["name"],
-                        "header": g["header_image"],
+                        "name": g.get("name", f"AppID {appid}"),
+                        "header": g.get("header_image", None),
                         "steam": f"https://store.steampowered.com/app/{appid}",
                         "steamdb": f"https://steamdb.info/app/{appid}"
                     }
-        return {"name": f"AppID {appid}", "header": None,
-                "steam": f"https://store.steampowered.com/app/{appid}",
-                "steamdb": f"https://steamdb.info/app/{appid}"}
     except:
-        return {"name": f"AppID {appid}", "header": None,
-                "steam": f"https://store.steampowered.com/app/{appid}",
-                "steamdb": f"https://steamdb.info/app/{appid}"}
+        pass
+    return {
+        "name": f"AppID {appid}",
+        "header": None,
+        "steam": f"https://store.steampowered.com/app/{appid}",
+        "steamdb": f"https://steamdb.info/app/{appid}"
+    }
 
-# ====== SLASH COMMAND /gen ======
-@tree.command(name="gen", description="Generate manifest dari Google Drive dengan AppID")
+# =========================
+# /gen command
+# - Post info publik ke channel
+# - ZIP dikirim private via DM ke requester
+# =========================
+@tree.command(name="gen", description="Ambil manifest (.zip) dari Google Drive via AppID")
 async def gen(interaction: discord.Interaction, appid: str):
     ensure_guild_config(interaction.guild_id)
-    await interaction.response.defer(ephemeral=True)
+    # defer publik: supaya embed info bisa dilihat semua orang
+    await interaction.response.defer(ephemeral=False)
 
     try:
         query = f"name contains '{appid}.zip' and '{FOLDER_ID}' in parents"
@@ -126,72 +147,103 @@ async def gen(interaction: discord.Interaction, appid: str):
         items = results.get("files", [])
 
         if not items:
-            await interaction.followup.send(f"❌ File untuk AppID {appid} tidak ditemukan.", ephemeral=True)
-
-            # kirim notif ke channel update
-            update_ch = config[str(interaction.guild_id)]["update_channel"]
-            if update_ch:
-                channel = bot.get_channel(update_ch)
-                if channel:
+            # beri tahu publik bahwa file tidak ada
+            await interaction.followup.send(f"❌ File untuk AppID {appid} tidak ditemukan.")
+            # opsional: post juga ke channel "update" server ini sebagai log request not found
+            up_ch = config[str(interaction.guild_id)]["update_channel"]
+            if up_ch:
+                ch = bot.get_channel(up_ch)
+                if ch:
                     info = await fetch_steam_info(appid)
                     embed = discord.Embed(
                         title="📌 Game Requested (Not Found)",
-                        description=f"User `{interaction.user}` request AppID **{appid}**",
+                        description=f"User {interaction.user.mention} request AppID **{appid}**",
                         color=discord.Color.purple()
                     )
                     embed.add_field(name="Steam Store", value=f"[Open]({info['steam']})", inline=True)
                     embed.add_field(name="SteamDB", value=f"[Open]({info['steamdb']})", inline=True)
                     embed.set_footer(text="Requested via /gen")
-                    await channel.send(embed=embed)
+                    await ch.send(embed=embed)
             return
 
         file = items[0]
-        file_id, file_name = file["id"], file["name"]
-        created, modified = file["createdTime"], file["modifiedTime"]
+        file_id = file["id"]
+        file_name = file["name"]
+        created = file.get("createdTime", "")
+        modified = file.get("modifiedTime", "")
         size_kb = int(file.get("size", 0)) // 1024
+
         info = await fetch_steam_info(appid)
 
-        # download file zip sementara
-        filepath = f"/tmp/{file_name}"
-        downloader = requests.get(
-            f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
-            headers={"Authorization": f"Bearer {creds.token}"},
-            stream=True
-        )
-        with open(filepath, "wb") as f:
-            for chunk in downloader.iter_content(chunk_size=4096):
-                if chunk:
-                    f.write(chunk)
-
-        embed = discord.Embed(
-            title="✅ Manifest Retrieved",
-            description=f"Game manifest berhasil diambil!",
+        # Embed publik (info requester + info game)
+        embed_pub = discord.Embed(
+            title="✅ Manifest Requested",
+            description=f"Diminta oleh {interaction.user.mention}",
             color=discord.Color.purple()
         )
-        embed.add_field(name="🎮 Game", value=info['name'], inline=True)
-        embed.add_field(name="🆔 Steam ID", value=appid, inline=True)
-        embed.add_field(name="📦 File Size", value=f"{size_kb} KB", inline=True)
-        embed.add_field(name="📅 Upload", value=created[:10], inline=True)
-        embed.add_field(name="♻️ Update", value=modified[:10], inline=True)
-        embed.add_field(name="🔗 Links", value=f"[Steam Store]({info['steam']}) | [SteamDB]({info['steamdb']})", inline=False)
-        embed.add_field(name="🙋 Requester", value=interaction.user.mention, inline=True)
+        embed_pub.add_field(name="🎮 Game", value=info["name"], inline=True)
+        embed_pub.add_field(name="🆔 AppID", value=appid, inline=True)
+        embed_pub.add_field(name="📦 Size", value=f"{size_kb} KB", inline=True)
+        embed_pub.add_field(name="📅 Upload", value=created[:10], inline=True)
+        embed_pub.add_field(name="♻️ Update", value=modified[:10], inline=True)
+        embed_pub.add_field(name="🔗 Links", value=f"[Steam]({info['steam']}) | [SteamDB]({info['steamdb']})", inline=False)
+        if info["header"]:
+            embed_pub.set_image(url=info["header"])
+        embed_pub.set_footer(text="Generated by TechStation Manifest")
 
-        if info['header']:
-            embed.set_image(url=info['header'])
-        embed.set_footer(text="Generated by TechStation Manifest")
+        await interaction.followup.send(embed=embed_pub)  # publik
 
-        await interaction.followup.send(embed=embed, file=discord.File(filepath, file_name), ephemeral=True)
+        # Unduh ZIP ke temp dan kirim PRIVATE via DM
+        try:
+            filepath = f"/tmp/{file_name}"
+            r = requests.get(
+                f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
+                headers={"Authorization": f"Bearer {creds.token}"},
+                stream=True,
+                timeout=60
+            )
+            with open(filepath, "wb") as f_out:
+                for chunk in r.iter_content(chunk_size=1 << 14):
+                    if chunk:
+                        f_out.write(chunk)
+
+            # kirim via DM
+            dm_text = f"📥 **{info['name']}** (`{appid}`)\nBerikut file manifest yang kamu minta:"
+            await interaction.user.send(content=dm_text, file=discord.File(filepath, file_name))
+        except discord.Forbidden:
+            # DM tertutup — fallback kirim ephemerally ke requester
+            await interaction.followup.send(
+                content="⚠️ DM kamu tertutup. Aktifkan DM atau izinkan pesan dari server ini.\nSebagai alternatif, file dikirim privat di sini:",
+                ephemeral=True
+            )
+            # kirim file ephemeral (hanya requester yang melihat)
+            filepath = f"/tmp/{file_name}"
+            if not os.path.exists(filepath):
+                r = requests.get(
+                    f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
+                    headers={"Authorization": f"Bearer {creds.token}"},
+                    stream=True,
+                    timeout=60
+                )
+                with open(filepath, "wb") as f_out:
+                    for chunk in r.iter_content(chunk_size=1 << 14):
+                        if chunk:
+                            f_out.write(chunk)
+            await interaction.followup.send(file=discord.File(filepath, file_name), ephemeral=True)
 
     except Exception as e:
-        await interaction.followup.send(f"❌ Error saat generate manifest: {str(e)}", ephemeral=True)
+        await interaction.followup.send(f"❌ Error saat generate: {e}")
 
-# ====== BACKGROUND TASK CEK FILE ======
+# =========================
+# BACKGROUND: monitor Drive
+# - Added -> kirim ke upload_channel
+# - Updated (size berubah) -> kirim ke update_channel
+# =========================
 @tasks.loop(minutes=1)
 async def check_new_files():
     global known_files, ENABLE_UPLOAD_WATCH
     if not ENABLE_UPLOAD_WATCH:
         return
-
     try:
         results = drive_service.files().list(
             q=f"'{FOLDER_ID}' in parents",
@@ -200,85 +252,101 @@ async def check_new_files():
         items = results.get("files", [])
 
         for f in items:
-            fname, fid, mtime, fsize = f["name"], f["id"], f["modifiedTime"], f.get("size", "0")
+            fname = f["name"]
+            fid = f["id"]
+            mtime = f.get("modifiedTime", "")
+            fsize = f.get("size", "0")
             appid = fname.replace(".zip", "")
             info = await fetch_steam_info(appid)
 
+            # Baru
             if fname not in known_files:
                 known_files[fname] = {"id": fid, "mtime": mtime, "size": fsize}
-                for gid, conf in config.items():
-                    if conf["upload_channel"]:
-                        channel = bot.get_channel(conf["upload_channel"])
-                        if channel:
+                # broadcast ke semua guild yang punya upload_channel
+                for gid, conf in list(config.items()):
+                    ch_id = conf.get("upload_channel")
+                    if ch_id:
+                        ch = bot.get_channel(ch_id)
+                        if ch:
                             embed = discord.Embed(
                                 title="🆕 New Game Added",
-                                description=f"**{info['name']}** ({appid}) ditambahkan.",
+                                description=f"**{info['name']}** (`{appid}`) ditambahkan.",
                                 color=discord.Color.purple()
                             )
-                            embed.add_field(name="Upload Date", value=f["createdTime"][:10], inline=True)
-                            if info['header']:
-                                embed.set_thumbnail(url=info['header'])
-                            await channel.send(embed=embed)
+                            embed.add_field(name="Upload Date", value=f.get("createdTime","")[:10], inline=True)
+                            if info["header"]:
+                                embed.set_thumbnail(url=info["header"])
+                            await ch.send(embed=embed)
 
+            # Sudah ada -> cek size berubah (anti-spam)
             else:
                 if known_files[fname]["size"] != fsize:
                     known_files[fname] = {"id": fid, "mtime": mtime, "size": fsize}
-                    for gid, conf in config.items():
-                        if conf["update_channel"]:
-                            channel = bot.get_channel(conf["update_channel"])
-                            if channel:
+                    for gid, conf in list(config.items()):
+                        ch_id = conf.get("update_channel")
+                        if ch_id:
+                            ch = bot.get_channel(ch_id)
+                            if ch:
                                 embed = discord.Embed(
                                     title="♻️ Game Updated",
-                                    description=f"**{info['name']}** ({appid}) diperbarui (size berubah).",
+                                    description=f"**{info['name']}** (`{appid}`) diperbarui (size berubah).",
                                     color=discord.Color.purple()
                                 )
                                 embed.add_field(name="Update Date", value=mtime[:10], inline=True)
                                 embed.add_field(name="New Size", value=f"{int(fsize)//1024} KB", inline=True)
-                                if info['header']:
-                                    embed.set_thumbnail(url=info['header'])
-                                await channel.send(embed=embed)
+                                if info["header"]:
+                                    embed.set_thumbnail(url=info["header"])
+                                await ch.send(embed=embed)
 
     except Exception as e:
-        print(f"❌ Error di check_new_files: {e}")
+        print(f"❌ check_new_files error: {e}")
 
-# ====== SLASH COMMAND NOTIF ======
-@tree.command(name="notif", description="Aktifkan atau matikan auto-notif upload/update")
+# =========================
+# /notif on|off
+# =========================
+@tree.command(name="notif", description="Aktif/Nonaktif monitor Drive (added/updated)")
 async def notif(interaction: discord.Interaction, mode: str):
     global ENABLE_UPLOAD_WATCH
     mode = mode.lower()
     if mode == "on":
         ENABLE_UPLOAD_WATCH = True
         initialize_known_files()
-        await interaction.response.send_message("🔔 Notifikasi AKTIF (file baru/update).")
+        await interaction.response.send_message("🔔 Notifikasi Drive: **AKTIF** (added & updated).")
     elif mode == "off":
         ENABLE_UPLOAD_WATCH = False
-        await interaction.response.send_message("🔕 Notifikasi DIMATIKAN.")
+        await interaction.response.send_message("🔕 Notifikasi Drive: **NONAKTIF**.")
     else:
-        await interaction.response.send_message("❌ Gunakan `/notif on` atau `/notif off`")
+        await interaction.response.send_message("❌ Gunakan: `/notif on` atau `/notif off`")
 
-# ====== SLASH COMMAND SETUP CHANNEL ======
+# =========================
+# /channeluploadsetup & /channelupdatesetup (per guild)
+# =========================
 @tree.command(name="channeluploadsetup", description="Set channel untuk notif file baru (Added)")
 async def channeluploadsetup(interaction: discord.Interaction, channel: discord.TextChannel):
     ensure_guild_config(interaction.guild_id)
     config[str(interaction.guild_id)]["upload_channel"] = channel.id
     save_config(config)
-    await interaction.response.send_message(f"✅ Channel Added diset ke {channel.mention}")
+    await interaction.response.send_message(f"✅ Channel **Added** diset ke {channel.mention}")
 
-@tree.command(name="channelupdatesetup", description="Set channel untuk notif file updated (Replaced)")
+@tree.command(name="channelupdatesetup", description="Set channel untuk notif file update (size berubah)")
 async def channelupdatesetup(interaction: discord.Interaction, channel: discord.TextChannel):
     ensure_guild_config(interaction.guild_id)
     config[str(interaction.guild_id)]["update_channel"] = channel.id
     save_config(config)
-    await interaction.response.send_message(f"✅ Channel Updated diset ke {channel.mention}")
+    await interaction.response.send_message(f"✅ Channel **Updated** diset ke {channel.mention}")
 
-# ====== ON READY ======
+# =========================
+# READY
+# =========================
 @bot.event
 async def on_ready():
     await tree.sync()
-    print(f"✅ Bot {bot.user} sudah online!")
+    print(f"✅ Bot {bot.user} online di {len(bot.guilds)} server.")
     initialize_known_files()
     check_new_files.start()
 
-# ====== START BOT ======
+# =========================
+# START
+# =========================
 keep_alive()
 bot.run(DISCORD_TOKEN)
