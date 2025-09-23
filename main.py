@@ -184,8 +184,6 @@ async def gen(interaction: discord.Interaction, appid: str):
         embed.add_field(name="🆔 AppID", value=appid, inline=True)
         embed.add_field(name="📦 File Size", value=f"{size_kb} KB", inline=True)
 
-        # best-effort game size / platforms
-        game_size = "Unknown"
         # Steam API doesn't reliably provide install size; leave Unknown
         embed.add_field(name="🗂 Game Size", value=game_size, inline=True)
 
@@ -234,7 +232,7 @@ async def gen(interaction: discord.Interaction, appid: str):
             return
 
         # ephemeral followup with file (only requester can see/download)
-        await interaction.followup.send(content="📥 File manifest siap diunduh (private):", file=discord.File(tmp_path, file_name), ephemeral=True)
+        await interaction.followup.send(content="📥 File manifest siap diunduh :", file=discord.File(tmp_path, file_name), ephemeral=True)
 
     except Exception as e:
         await interaction.followup.send(f"❌ Error saat menjalankan /gen: {e}", ephemeral=False)
