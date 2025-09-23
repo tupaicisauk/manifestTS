@@ -8,6 +8,7 @@ from threading import Thread
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 import aiohttp
+import requests
 
 # ====== KEEP ALIVE SERVER ======
 app = Flask(__name__)
@@ -61,7 +62,7 @@ UPLOAD_CHANNEL_ID = config.get("upload_channel")
 REQUEST_CHANNEL_ID = config.get("request_channel")
 
 # ====== CACHE ======
-known_files = {}  # { filename: {"id": id, "mtime": modifiedTime} }
+known_files = {}
 ENABLE_UPLOAD_WATCH = False
 
 # ====== INIT CACHE ======
@@ -86,73 +87,93 @@ async def fetch_steam_info(appid: str):
             async with session.get(store_url) as resp:
                 data = await resp.json()
                 if data[str(appid)]["success"]:
-                    game_name = data[str(appid)]["data"]["name"]
-                    header_img = data[str(appid)]["data"]["header_image"]
-                else:
-                    game_name, header_img = f"AppID {appid}", None
-        return {
-            "name": game_name,
-            "steam": f"https://store.steampowered.com/app/{appid}",
-            "steamdb": f"https://steamdb.info/app/{appid}",
-            "header": header_img
-        }
+                    g = data[str(appid)]["data"]
+                    return {
+                        "name": g["name"],
+                        "header": g["header_image"],
+                        "steam": f"https://store.steampowered.com/app/{appid}",
+                        "steamdb": f"https://steamdb.info/app/{appid}"
+                    }
+        return {"name": f"AppID {appid}", "header": None,
+                "steam": f"https://store.steampowered.com/app/{appid}",
+                "steamdb": f"https://steamdb.info/app/{appid}"}
     except:
-        return {
-            "name": f"AppID {appid}",
-            "steam": f"https://store.steampowered.com/app/{appid}",
-            "steamdb": f"https://steamdb.info/app/{appid}",
-            "header": None
-        }
+        return {"name": f"AppID {appid}", "header": None,
+                "steam": f"https://store.steampowered.com/app/{appid}",
+                "steamdb": f"https://steamdb.info/app/{appid}"}
 
 # ====== SLASH COMMAND /gen ======
 @tree.command(name="gen", description="Generate manifest dari Google Drive dengan AppID")
 async def gen(interaction: discord.Interaction, appid: str):
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=True)
 
     try:
         query = f"name contains '{appid}.zip' and '{FOLDER_ID}' in parents"
         results = drive_service.files().list(
             q=query,
-            fields="files(id, name, createdTime, modifiedTime)"
+            fields="files(id, name, createdTime, modifiedTime, size)"
         ).execute()
         items = results.get("files", [])
 
         if not items:
-            await interaction.followup.send(f"❌ File untuk AppID {appid} tidak ditemukan.")
+            await interaction.followup.send(f"❌ File untuk AppID {appid} tidak ditemukan.", ephemeral=True)
 
-            # Kirim notif ke channel request
+            # kirim notif ke request_channel
             if REQUEST_CHANNEL_ID:
                 channel = bot.get_channel(REQUEST_CHANNEL_ID)
                 if channel:
+                    info = await fetch_steam_info(appid)
                     embed = discord.Embed(
                         title="📌 Game Requested (Not Found)",
-                        description=f"User `{interaction.user}` request **AppID {appid}** tapi tidak ada di database.",
+                        description=f"User `{interaction.user}` request AppID **{appid}**",
                         color=discord.Color.purple()
                     )
-                    embed.add_field(name="Links", value=f"[SteamDB](https://steamdb.info/app/{appid}) | [Steam Store](https://store.steampowered.com/app/{appid})", inline=False)
+                    embed.add_field(name="Steam Store", value=f"[Open]({info['steam']})", inline=True)
+                    embed.add_field(name="SteamDB", value=f"[Open]({info['steamdb']})", inline=True)
+                    embed.set_footer(text="Requested via /gen")
                     await channel.send(embed=embed)
             return
 
         file = items[0]
-        file_name = file["name"]
+        file_id, file_name = file["id"], file["name"]
         created, modified = file["createdTime"], file["modifiedTime"]
+        size = int(file.get("size", 0)) // 1024  # KB
         info = await fetch_steam_info(appid)
 
+        # download file zip sementara
+        filepath = f"/tmp/{file_name}"
+        downloader = requests.get(
+            f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
+            headers={"Authorization": f"Bearer {creds.token}"},
+            stream=True
+        )
+        with open(filepath, "wb") as f:
+            for chunk in downloader.iter_content(chunk_size=4096):
+                if chunk:
+                    f.write(chunk)
+
+        # embed style keren
         embed = discord.Embed(
-            title=f"✅ Manifest Generated",
-            description=f"**{info['name']}** ({appid})",
+            title="✅ Manifest Retrieved",
+            description=f"Game manifest berhasil diambil!",
             color=discord.Color.purple()
         )
-        embed.add_field(name="Links", value=f"[Steam Store]({info['steam']}) | [SteamDB]({info['steamdb']})", inline=False)
-        embed.add_field(name="Google Drive", value=f"Upload: {created[:10]} • Update: {modified[:10]}", inline=False)
+        embed.add_field(name="🎮 Game", value=info['name'], inline=True)
+        embed.add_field(name="🆔 Steam ID", value=appid, inline=True)
+        embed.add_field(name="📦 File Size", value=f"{size} KB", inline=True)
+        embed.add_field(name="📅 Upload", value=created[:10], inline=True)
+        embed.add_field(name="♻️ Update", value=modified[:10], inline=True)
+        embed.add_field(name="🔗 Links", value=f"[Steam Store]({info['steam']}) | [SteamDB]({info['steamdb']})", inline=False)
+        embed.add_field(name="🙋 Requester", value=interaction.user.mention, inline=True)
+
         if info['header']:
-            embed.set_thumbnail(url=info['header'])
+            embed.set_image(url=info['header'])
         embed.set_footer(text="Generated by TechStation Manifest")
 
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(embed=embed, file=discord.File(filepath, file_name), ephemeral=True)
 
     except Exception as e:
-        await interaction.followup.send(f"❌ Error saat generate manifest: {str(e)}")
+        await interaction.followup.send(f"❌ Error saat generate manifest: {str(e)}", ephemeral=True)
 
 # ====== BACKGROUND TASK CEK FILE ======
 @tasks.loop(minutes=1)
@@ -173,12 +194,10 @@ async def check_new_files():
             fname, fid, mtime = f["name"], f["id"], f["modifiedTime"]
 
             if fname in known_files:
-                # update
                 if (known_files[fname]["id"] != fid) or (known_files[fname]["mtime"] != mtime):
                     known_files[fname] = {"id": fid, "mtime": mtime}
                     appid = fname.replace(".zip", "")
                     info = await fetch_steam_info(appid)
-
                     embed = discord.Embed(
                         title="♻️ Game Updated",
                         description=f"**{info['name']}** ({appid}) diperbarui.",
@@ -188,19 +207,16 @@ async def check_new_files():
                     if info['header']:
                         embed.set_thumbnail(url=info['header'])
                     await channel.send(embed=embed)
-
             else:
-                # file baru
                 known_files[fname] = {"id": fid, "mtime": mtime}
                 appid = fname.replace(".zip", "")
                 info = await fetch_steam_info(appid)
-
                 embed = discord.Embed(
                     title="🆕 New Game Added",
                     description=f"**{info['name']}** ({appid}) ditambahkan.",
                     color=discord.Color.purple()
                 )
-                embed.add_field(name="Upload Date", value=f"{f['createdTime'][:10]}", inline=True)
+                embed.add_field(name="Upload Date", value=f["createdTime"][:10], inline=True)
                 if info['header']:
                     embed.set_thumbnail(url=info['header'])
                 await channel.send(embed=embed)
@@ -213,7 +229,6 @@ async def check_new_files():
 async def notif(interaction: discord.Interaction, mode: str):
     global ENABLE_UPLOAD_WATCH
     mode = mode.lower()
-
     if mode == "on":
         ENABLE_UPLOAD_WATCH = True
         initialize_known_files()
