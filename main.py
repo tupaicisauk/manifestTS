@@ -184,9 +184,6 @@ async def gen(interaction: discord.Interaction, appid: str):
         embed.add_field(name="🆔 AppID", value=appid, inline=True)
         embed.add_field(name="📦 File Size", value=f"{size_kb} KB", inline=True)
 
-        # Steam API doesn't reliably provide install size; leave Unknown
-        embed.add_field(name="🗂 Game Size", value=game_size, inline=True)
-
         # description/info/store
         if info.get("description"):
             embed.add_field(name="💙 Game Info", value=info["description"], inline=False)
