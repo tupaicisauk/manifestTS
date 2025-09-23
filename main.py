@@ -51,7 +51,7 @@ def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"upload_channel": None, "request_channel": None}
+    return {"upload_channel": None, "update_channel": None}
 
 def save_config(config):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -59,9 +59,10 @@ def save_config(config):
 
 config = load_config()
 UPLOAD_CHANNEL_ID = config.get("upload_channel")
-REQUEST_CHANNEL_ID = config.get("request_channel")
+UPDATE_CHANNEL_ID = config.get("update_channel")
 
 # ====== CACHE ======
+# { filename: {"id": id, "mtime": modifiedTime, "size": size} }
 known_files = {}
 ENABLE_UPLOAD_WATCH = False
 
@@ -71,10 +72,13 @@ def initialize_known_files():
     try:
         results = drive_service.files().list(
             q=f"'{FOLDER_ID}' in parents",
-            fields="files(id, name, modifiedTime)"
+            fields="files(id, name, modifiedTime, size)"
         ).execute()
         items = results.get("files", [])
-        known_files = {f["name"]: {"id": f["id"], "mtime": f["modifiedTime"]} for f in items}
+        known_files = {
+            f["name"]: {"id": f["id"], "mtime": f["modifiedTime"], "size": f.get("size", "0")}
+            for f in items
+        }
         print(f"🔹 Initialized {len(known_files)} file ke cache.")
     except Exception as e:
         print(f"❌ Error init known files: {e}")
@@ -118,9 +122,9 @@ async def gen(interaction: discord.Interaction, appid: str):
         if not items:
             await interaction.followup.send(f"❌ File untuk AppID {appid} tidak ditemukan.", ephemeral=True)
 
-            # kirim notif ke request_channel
-            if REQUEST_CHANNEL_ID:
-                channel = bot.get_channel(REQUEST_CHANNEL_ID)
+            # kirim notif ke channel update (log request not found)
+            if UPDATE_CHANNEL_ID:
+                channel = bot.get_channel(UPDATE_CHANNEL_ID)
                 if channel:
                     info = await fetch_steam_info(appid)
                     embed = discord.Embed(
@@ -137,7 +141,7 @@ async def gen(interaction: discord.Interaction, appid: str):
         file = items[0]
         file_id, file_name = file["id"], file["name"]
         created, modified = file["createdTime"], file["modifiedTime"]
-        size = int(file.get("size", 0)) // 1024  # KB
+        size_kb = int(file.get("size", 0)) // 1024
         info = await fetch_steam_info(appid)
 
         # download file zip sementara
@@ -160,7 +164,7 @@ async def gen(interaction: discord.Interaction, appid: str):
         )
         embed.add_field(name="🎮 Game", value=info['name'], inline=True)
         embed.add_field(name="🆔 Steam ID", value=appid, inline=True)
-        embed.add_field(name="📦 File Size", value=f"{size} KB", inline=True)
+        embed.add_field(name="📦 File Size", value=f"{size_kb} KB", inline=True)
         embed.add_field(name="📅 Upload", value=created[:10], inline=True)
         embed.add_field(name="♻️ Update", value=modified[:10], inline=True)
         embed.add_field(name="🔗 Links", value=f"[Steam Store]({info['steam']}) | [SteamDB]({info['steamdb']})", inline=False)
@@ -178,48 +182,55 @@ async def gen(interaction: discord.Interaction, appid: str):
 # ====== BACKGROUND TASK CEK FILE ======
 @tasks.loop(minutes=1)
 async def check_new_files():
-    global known_files, ENABLE_UPLOAD_WATCH, UPLOAD_CHANNEL_ID
-    if not ENABLE_UPLOAD_WATCH or not UPLOAD_CHANNEL_ID:
+    global known_files, ENABLE_UPLOAD_WATCH, UPLOAD_CHANNEL_ID, UPDATE_CHANNEL_ID
+    if not ENABLE_UPLOAD_WATCH:
         return
 
     try:
         results = drive_service.files().list(
             q=f"'{FOLDER_ID}' in parents",
-            fields="files(id, name, createdTime, modifiedTime)"
+            fields="files(id, name, createdTime, modifiedTime, size)"
         ).execute()
         items = results.get("files", [])
-        channel = bot.get_channel(UPLOAD_CHANNEL_ID)
 
         for f in items:
-            fname, fid, mtime = f["name"], f["id"], f["modifiedTime"]
+            fname, fid, mtime, fsize = f["name"], f["id"], f["modifiedTime"], f.get("size", "0")
+            appid = fname.replace(".zip", "")
+            info = await fetch_steam_info(appid)
 
-            if fname in known_files:
-                if (known_files[fname]["id"] != fid) or (known_files[fname]["mtime"] != mtime):
-                    known_files[fname] = {"id": fid, "mtime": mtime}
-                    appid = fname.replace(".zip", "")
-                    info = await fetch_steam_info(appid)
-                    embed = discord.Embed(
-                        title="♻️ Game Updated",
-                        description=f"**{info['name']}** ({appid}) diperbarui.",
-                        color=discord.Color.purple()
-                    )
-                    embed.add_field(name="Update Date", value=mtime[:10], inline=True)
-                    if info['header']:
-                        embed.set_thumbnail(url=info['header'])
-                    await channel.send(embed=embed)
+            # file baru
+            if fname not in known_files:
+                known_files[fname] = {"id": fid, "mtime": mtime, "size": fsize}
+                if UPLOAD_CHANNEL_ID:
+                    channel = bot.get_channel(UPLOAD_CHANNEL_ID)
+                    if channel:
+                        embed = discord.Embed(
+                            title="🆕 New Game Added",
+                            description=f"**{info['name']}** ({appid}) ditambahkan.",
+                            color=discord.Color.purple()
+                        )
+                        embed.add_field(name="Upload Date", value=f["createdTime"][:10], inline=True)
+                        if info['header']:
+                            embed.set_thumbnail(url=info['header'])
+                        await channel.send(embed=embed)
+
+            # file ada → cek size beda
             else:
-                known_files[fname] = {"id": fid, "mtime": mtime}
-                appid = fname.replace(".zip", "")
-                info = await fetch_steam_info(appid)
-                embed = discord.Embed(
-                    title="🆕 New Game Added",
-                    description=f"**{info['name']}** ({appid}) ditambahkan.",
-                    color=discord.Color.purple()
-                )
-                embed.add_field(name="Upload Date", value=f["createdTime"][:10], inline=True)
-                if info['header']:
-                    embed.set_thumbnail(url=info['header'])
-                await channel.send(embed=embed)
+                if known_files[fname]["size"] != fsize:
+                    known_files[fname] = {"id": fid, "mtime": mtime, "size": fsize}
+                    if UPDATE_CHANNEL_ID:
+                        channel = bot.get_channel(UPDATE_CHANNEL_ID)
+                        if channel:
+                            embed = discord.Embed(
+                                title="♻️ Game Updated",
+                                description=f"**{info['name']}** ({appid}) diperbarui (size berubah).",
+                                color=discord.Color.purple()
+                            )
+                            embed.add_field(name="Update Date", value=mtime[:10], inline=True)
+                            embed.add_field(name="New Size", value=f"{int(fsize)//1024} KB", inline=True)
+                            if info['header']:
+                                embed.set_thumbnail(url=info['header'])
+                            await channel.send(embed=embed)
 
     except Exception as e:
         print(f"❌ Error di check_new_files: {e}")
@@ -240,21 +251,21 @@ async def notif(interaction: discord.Interaction, mode: str):
         await interaction.response.send_message("❌ Gunakan `/notif on` atau `/notif off`")
 
 # ====== SLASH COMMAND SETUP CHANNEL ======
-@tree.command(name="channeluploadsetup", description="Set channel untuk notif upload/update game")
+@tree.command(name="channeluploadsetup", description="Set channel untuk notif file baru (Added)")
 async def channeluploadsetup(interaction: discord.Interaction, channel: discord.TextChannel):
     global UPLOAD_CHANNEL_ID, config
     UPLOAD_CHANNEL_ID = channel.id
     config["upload_channel"] = channel.id
     save_config(config)
-    await interaction.response.send_message(f"✅ Channel upload/update diset ke {channel.mention}")
+    await interaction.response.send_message(f"✅ Channel Added diset ke {channel.mention}")
 
-@tree.command(name="channelupdatesetup", description="Set channel untuk notif request game yang belum ada")
+@tree.command(name="channelupdatesetup", description="Set channel untuk notif file updated (Replaced)")
 async def channelupdatesetup(interaction: discord.Interaction, channel: discord.TextChannel):
-    global REQUEST_CHANNEL_ID, config
-    REQUEST_CHANNEL_ID = channel.id
-    config["request_channel"] = channel.id
+    global UPDATE_CHANNEL_ID, config
+    UPDATE_CHANNEL_ID = channel.id
+    config["update_channel"] = channel.id
     save_config(config)
-    await interaction.response.send_message(f"✅ Channel request-not-found diset ke {channel.mention}")
+    await interaction.response.send_message(f"✅ Channel Updated diset ke {channel.mention}")
 
 # ====== ON READY ======
 @bot.event
