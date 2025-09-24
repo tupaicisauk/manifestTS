@@ -1,4 +1,3 @@
-# main.py
 import os
 import json
 import time
@@ -82,7 +81,8 @@ def initialize_known_files():
     try:
         results = drive_service.files().list(
             q=f"'{FOLDER_ID}' in parents",
-            fields="files(id,name,createdTime,modifiedTime,size)"
+            fields="files(id,name,createdTime,modifiedTime,size)",
+            pageSize=1000  # memastikan listing tidak kepotong untuk folder besar
         ).execute()
         items = results.get("files", [])
         known_files = {
@@ -106,10 +106,19 @@ def count_manifests_in_cache(appid: str):
     prefix = f"{appid}"
     count = 0
     for name in known_files.keys():
-        # normalize and check
         if name.startswith(prefix) or f"{prefix}.zip" in name:
             count += 1
     return count
+
+# helper: pastikan channel selalu bisa di-resolve meski tidak ada di cache
+async def _resolve_channel(ch_id: int):
+    ch = bot.get_channel(ch_id)
+    if ch is None:
+        try:
+            ch = await bot.fetch_channel(ch_id)
+        except Exception:
+            ch = None
+    return ch
 
 # =============== STEAM INFO HELPER ===============
 async def fetch_steam_info(appid: str):
@@ -118,7 +127,6 @@ async def fetch_steam_info(appid: str):
         async with aiohttp.ClientSession() as session:
             url = f"https://store.steampowered.com/api/appdetails?appids={appid}"
             async with session.get(url, timeout=15) as resp:
-                # sometimes Steam returns text/html if blocked -> catch exceptions
                 data = await resp.json()
                 entry = data.get(str(appid), {})
                 if entry.get("success"):
@@ -158,11 +166,13 @@ async def gen(interaction: discord.Interaction, appid: str):
 
     try:
         q = f"name contains '{appid}.zip' and '{FOLDER_ID}' in parents"
-        results = drive_service.files().list(q=q, fields="files(id,name,createdTime,modifiedTime,size)").execute()
+        results = drive_service.files().list(
+            q=q,
+            fields="files(id,name,createdTime,modifiedTime,size)"
+        ).execute()
         items = results.get("files", [])
 
         if not items:
-            # not found: publish to user & optionally to configured request channel with mention
             info = await fetch_steam_info(appid)
             embed_nf = discord.Embed(
                 title="🚨 Game Requested (Not Found)",
@@ -192,7 +202,6 @@ async def gen(interaction: discord.Interaction, appid: str):
                         await ch.send(embed=embed_nf)
             return
 
-        # file found -> present public embed, then private download (only requester)
         f = items[0]
         file_id, file_name = f["id"], f["name"]
         created = f.get("createdTime", "")
@@ -248,7 +257,11 @@ async def check_new_files():
     if not ENABLE_UPLOAD_WATCH:
         return
     try:
-        results = drive_service.files().list(q=f"'{FOLDER_ID}' in parents", fields="files(id,name,createdTime,modifiedTime,size)").execute()
+        results = drive_service.files().list(
+            q=f"'{FOLDER_ID}' in parents",
+            fields="files(id,name,createdTime,modifiedTime,size)",
+            pageSize=1000  # memastikan listing tidak kepotong
+        ).execute()
         items = results.get("files", [])
 
         for f in items:
@@ -263,51 +276,58 @@ async def check_new_files():
             # NEW
             if fname not in known_files:
                 known_files[fname] = {"id": fid, "mtime": mtime, "ctime": ctime, "size": fsize}
-                # count files for this appid
                 total_files = count_manifests_in_cache(appid)
                 for gid, conf in list(config.items()):
                     ch_id = conf.get("upload_channel")
-                    if ch_id and (ch := bot.get_channel(ch_id)):
-                        embed = discord.Embed(
-                            title=f"🆕 New Game Added — {info['name']} ({appid})",
-                            description=f"**{info['name']}** (`{appid}`) ditambahkan ke drive.",
-                            color=discord.Color.blue()
-                        )
-                        # details fields
-                        if info.get("developer"): embed.add_field(name="👨‍💼 Developer", value=info["developer"], inline=True)
-                        if info.get("release_date"): embed.add_field(name="📅 Release Date", value=info["release_date"], inline=True)
-                        embed.add_field(name="📦 Manifest Files", value=str(total_files), inline=True)
-                        embed.add_field(name="📅 Upload Date", value=ctime[:10], inline=True)
-                        embed.add_field(name="🔗 Links", value=f"[Steam]({info['steam']}) | [SteamDB]({info['steamdb']})", inline=False)
-                        if info.get("header"): embed.set_image(url=info["header"])
-                        embed.timestamp = discord.utils.utcnow()
-                        embed.set_footer(text="Reported by TechStation Manifest")
-                        await ch.send(embed=embed)
-
-            # UPDATED (size changed)
-            else:
-                if known_files[fname]["size"] != fsize:
-                    known_files[fname] = {"id": fid, "mtime": mtime, "ctime": ctime, "size": fsize}
-                    total_files = count_manifests_in_cache(appid)
-                    for gid, conf in list(config.items()):
-                        ch_id = conf.get("update_channel")
-                        if ch_id and (ch := bot.get_channel(ch_id)):
+                    if ch_id:
+                        ch = await _resolve_channel(ch_id)
+                        if ch:
                             embed = discord.Embed(
-                                title=f"♻️ Game Updated — {info['name']} ({appid})",
-                                description=f"**{info['name']}** (`{appid}`) diperbarui (file size berubah).",
-                                color=discord.Color.orange()
+                                title=f"🆕 New Game Added — {info['name']} ({appid})",
+                                description=f"**{info['name']}** (`{appid}`) ditambahkan ke drive.",
+                                color=discord.Color.blue()
                             )
                             if info.get("developer"): embed.add_field(name="👨‍💼 Developer", value=info["developer"], inline=True)
                             if info.get("release_date"): embed.add_field(name="📅 Release Date", value=info["release_date"], inline=True)
                             embed.add_field(name="📦 Manifest Files", value=str(total_files), inline=True)
-                            embed.add_field(name="📅 Upload Date", value=known_files[fname].get("ctime", "")[:10], inline=True)
-                            embed.add_field(name="🔁 Update Date", value=mtime[:10], inline=True)
-                            embed.add_field(name="📦 New Size", value=f"{int(fsize)//1024} KB", inline=True)
+                            embed.add_field(name="📦 File Size", value=f"{int(fsize)//1024} KB", inline=True)
+                            embed.add_field(name="📅 Upload Date", value=ctime[:10], inline=True)
                             embed.add_field(name="🔗 Links", value=f"[Steam]({info['steam']}) | [SteamDB]({info['steamdb']})", inline=False)
                             if info.get("header"): embed.set_image(url=info["header"])
                             embed.timestamp = discord.utils.utcnow()
                             embed.set_footer(text="Reported by TechStation Manifest")
                             await ch.send(embed=embed)
+
+            # UPDATED (jika ukuran ATAU modifiedTime berubah)
+            else:
+                if (known_files[fname]["size"] != fsize) or (known_files[fname]["mtime"] != mtime):
+                    old_size_kb = int(known_files[fname]["size"]) // 1024
+                    new_size_kb = int(fsize) // 1024
+
+                    known_files[fname] = {"id": fid, "mtime": mtime, "ctime": ctime, "size": fsize}
+                    total_files = count_manifests_in_cache(appid)
+                    for gid, conf in list(config.items()):
+                        ch_id = conf.get("update_channel")
+                        if ch_id:
+                            ch = await _resolve_channel(ch_id)
+                            if ch:
+                                embed = discord.Embed(
+                                    title=f"♻️ Game Updated — {info['name']} ({appid})",
+                                    description=f"**{info['name']}** (`{appid}`) diperbarui.",
+                                    color=discord.Color.orange()
+                                )
+                                if info.get("developer"): embed.add_field(name="👨‍💼 Developer", value=info["developer"], inline=True)
+                                if info.get("release_date"): embed.add_field(name="📅 Release Date", value=info["release_date"], inline=True)
+                                embed.add_field(name="📦 Manifest Files", value=str(total_files), inline=True)
+                                embed.add_field(name="📦 Old Size", value=f"{old_size_kb} KB", inline=True)
+                                embed.add_field(name="📦 New Size", value=f"{new_size_kb} KB", inline=True)
+                                embed.add_field(name="📅 Upload Date", value=ctime[:10], inline=True)
+                                embed.add_field(name="🔁 Update Date", value=mtime[:10], inline=True)
+                                embed.add_field(name="🔗 Links", value=f"[Steam]({info['steam']}) | [SteamDB]({info['steamdb']})", inline=False)
+                                if info.get("header"): embed.set_image(url=info["header"])
+                                embed.timestamp = discord.utils.utcnow()
+                                embed.set_footer(text="Reported by TechStation Manifest")
+                                await ch.send(embed=embed)
 
     except Exception as e:
         print("check_new_files error:", e)
