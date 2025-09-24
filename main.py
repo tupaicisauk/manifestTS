@@ -19,7 +19,9 @@ def home():
     return "Bot is alive!"
 
 def run_web():
-    app.run(host="0.0.0.0", port=8080)
+    # PATCH: bind ke PORT dari env (Render)
+    port = int(os.environ.get("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)
 
 def keep_alive():
     t = Thread(target=run_web, daemon=True)
@@ -28,6 +30,7 @@ def keep_alive():
 # =============== DISCORD SETUP ===============
 intents = discord.Intents.default()
 intents.guilds = True
+# if you need to access members or message content later, enable appropriate intents and env vars
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
@@ -75,7 +78,7 @@ def ensure_guild_config(guild_id: int):
 known_files = {}
 ENABLE_UPLOAD_WATCH = False
 
-# tambahan anti-spam
+# anti-spam Added
 NOTIFIED_FILE = "notified.json"
 
 def load_notified():
@@ -112,19 +115,26 @@ def initialize_known_files():
         print("Error initializing known_files:", e)
 
 def count_manifests_in_cache(appid: str):
+    """
+    Count number of manifest files in cache for a given appid.
+    We consider files whose name starts with '{appid}' or contains '{appid}.zip'
+    """
     prefix = f"{appid}"
     count = 0
     for name in known_files.keys():
+        # normalize and check
         if name.startswith(prefix) or f"{prefix}.zip" in name:
             count += 1
     return count
 
 # =============== STEAM INFO HELPER ===============
 async def fetch_steam_info(appid: str):
+    """Fetch store API details (best-effort)."""
     try:
         async with aiohttp.ClientSession() as session:
             url = f"https://store.steampowered.com/api/appdetails?appids={appid}"
             async with session.get(url, timeout=15) as resp:
+                # sometimes Steam returns text/html if blocked -> catch exceptions
                 data = await resp.json()
                 entry = data.get(str(appid), {})
                 if entry.get("success"):
@@ -154,6 +164,36 @@ async def fetch_steam_info(appid: str):
     }
 
 # =============== /gen COMMAND ===============
+DISCORD_UPLOAD_LIMIT_BYTES = 8 * 1024 * 1024  # ~8MB (server non-boost)
+
+def ensure_public_link(file_id: str):
+    """Pastikan file bisa diakses via link publik. Return (webContentLink, webViewLink)."""
+    try:
+        meta = drive_service.files().get(
+            fileId=file_id, fields="webContentLink, webViewLink, permissions"
+        ).execute()
+        web_content = meta.get("webContentLink")
+        web_view = meta.get("webViewLink")
+
+        perms = meta.get("permissions", [])
+        is_public = any(p.get("type") == "anyone" for p in perms)
+        if not is_public:
+            try:
+                drive_service.permissions().create(
+                    fileId=file_id,
+                    body={"type": "anyone", "role": "reader"},
+                ).execute()
+                meta = drive_service.files().get(
+                    fileId=file_id, fields="webContentLink, webViewLink"
+                ).execute()
+                web_content = meta.get("webContentLink")
+                web_view = meta.get("webViewLink")
+            except Exception:
+                pass
+        return web_content, web_view
+    except Exception:
+        return None, None
+
 @tree.command(name="gen", description="Ambil manifest (.zip) dari Google Drive via AppID")
 async def gen(interaction: discord.Interaction, appid: str):
     if interaction.guild_id:
@@ -168,6 +208,7 @@ async def gen(interaction: discord.Interaction, appid: str):
         items = results.get("files", [])
 
         if not items:
+            # not found: publish to user & optionally to configured request channel with mention
             info = await fetch_steam_info(appid)
             embed_nf = discord.Embed(
                 title="🚨 Game Requested (Not Found)",
@@ -197,6 +238,7 @@ async def gen(interaction: discord.Interaction, appid: str):
                         await ch.send(embed=embed_nf)
             return
 
+        # file found -> present public embed, then private download (only requester)
         f = items[0]
         file_id, file_name = f["id"], f["name"]
         created = f.get("createdTime", "")
@@ -224,6 +266,17 @@ async def gen(interaction: discord.Interaction, appid: str):
 
         await interaction.followup.send(embed=embed, ephemeral=False)
 
+        # PATCH: bila file kebesaran untuk upload ke Discord, kirim link Drive saja
+        if int(f.get("size", 0)) > DISCORD_UPLOAD_LIMIT_BYTES:
+            dl_link, view_link = ensure_public_link(file_id)
+            link_text = dl_link or view_link or f"https://drive.google.com/file/d/{file_id}/view"
+            await interaction.followup.send(
+                content=f"⚠️ File terlalu besar untuk diupload ke Discord.\n🔗 **Download:** {link_text}",
+                ephemeral=True
+            )
+            return
+
+        # download file to temp and send as ephemeral (only requester)
         tmp_path = f"/tmp/{file_name}"
         r = requests.get(
             f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
@@ -251,10 +304,7 @@ async def check_new_files():
     if not ENABLE_UPLOAD_WATCH:
         return
     try:
-        results = drive_service.files().list(
-            q=f"'{FOLDER_ID}' in parents",
-            fields="files(id,name,createdTime,modifiedTime,size)"
-        ).execute()
+        results = drive_service.files().list(q=f"'{FOLDER_ID}' in parents", fields="files(id,name,createdTime,modifiedTime,size)").execute()
         items = results.get("files", [])
 
         for f in items:
@@ -269,13 +319,13 @@ async def check_new_files():
             # NEW
             if fname not in known_files:
                 known_files[fname] = {"id": fid, "mtime": mtime, "ctime": ctime, "size": fsize}
-
-                # anti-spam hanya untuk Added
+                # anti-spam: hanya untuk Added
                 if fname in notified_files:
                     continue
                 notified_files.add(fname)
                 save_notified(notified_files)
 
+                # count files for this appid
                 total_files = count_manifests_in_cache(appid)
                 for gid, conf in list(config.items()):
                     ch_id = conf.get("upload_channel")
@@ -285,6 +335,7 @@ async def check_new_files():
                             description=f"**{info['name']}** (`{appid}`) ditambahkan ke drive.",
                             color=discord.Color.blue()
                         )
+                        # details fields
                         if info.get("developer"): embed.add_field(name="👨‍💼 Developer", value=info["developer"], inline=True)
                         if info.get("release_date"): embed.add_field(name="📅 Release Date", value=info["release_date"], inline=True)
                         embed.add_field(name="📦 Manifest Files", value=str(total_files), inline=True)
@@ -295,7 +346,7 @@ async def check_new_files():
                         embed.set_footer(text="Reported by TechStation Manifest")
                         await ch.send(embed=embed)
 
-            # UPDATED
+            # UPDATED (size ATAU mtime berubah)
             else:
                 if (known_files[fname]["size"] != fsize) or (known_files[fname]["mtime"] != mtime):
                     known_files[fname] = {"id": fid, "mtime": mtime, "ctime": ctime, "size": fsize}
