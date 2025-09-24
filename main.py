@@ -19,7 +19,7 @@ def home():
     return "Bot is alive!"
 
 def run_web():
-    # PATCH: bind ke PORT dari env (Render)
+    # Bind ke PORT dari env (Render)
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
 
@@ -266,7 +266,7 @@ async def gen(interaction: discord.Interaction, appid: str):
 
         await interaction.followup.send(embed=embed, ephemeral=False)
 
-        # PATCH: bila file kebesaran untuk upload ke Discord, kirim link Drive saja
+        # Kalau file kebesaran untuk upload ke Discord, kirim link Drive saja
         if int(f.get("size", 0)) > DISCORD_UPLOAD_LIMIT_BYTES:
             dl_link, view_link = ensure_public_link(file_id)
             link_text = dl_link or view_link or f"https://drive.google.com/file/d/{file_id}/view"
@@ -379,33 +379,37 @@ async def check_new_files():
 async def notif(interaction: discord.Interaction, mode: str):
     global ENABLE_UPLOAD_WATCH
     m = mode.lower()
+    await interaction.response.defer(ephemeral=True)  # cegah unknown interaction
     if m == "on":
         ENABLE_UPLOAD_WATCH = True
         initialize_known_files()
-        await interaction.response.send_message("🔔 Notifikasi Drive: **AKTIF**")
+        await interaction.followup.send("🔔 Notifikasi Drive: **AKTIF**")
     elif m == "off":
         ENABLE_UPLOAD_WATCH = False
-        await interaction.response.send_message("🔕 Notifikasi Drive: **NONAKTIF**")
+        await interaction.followup.send("🔕 Notifikasi Drive: **NONAKTIF**")
     else:
-        await interaction.response.send_message("Gunakan `/notif on` atau `/notif off`")
+        await interaction.followup.send("Gunakan `/notif on` atau `/notif off`")
 
 # =============== channel setup (per guild) ===============
 @tree.command(name="channeluploadsetup", description="📌 Set channel untuk notif file baru (Added)")
 async def channeluploadsetup(interaction: discord.Interaction, channel: discord.TextChannel):
+    await interaction.response.defer(ephemeral=True)  # cegah unknown interaction
     ensure_guild_config(interaction.guild_id)
     config[str(interaction.guild_id)]["upload_channel"] = channel.id
     save_config(config)
-    await interaction.response.send_message(f"✅ Channel Added diset ke {channel.mention}")
+    await interaction.followup.send(f"✅ Channel Added diset ke {channel.mention}")
 
 @tree.command(name="channelupdatesetup", description="📌 Set channel untuk notif file update")
 async def channelupdatesetup(interaction: discord.Interaction, channel: discord.TextChannel):
+    await interaction.response.defer(ephemeral=True)  # cegah unknown interaction
     ensure_guild_config(interaction.guild_id)
     config[str(interaction.guild_id)]["update_channel"] = channel.id
     save_config(config)
-    await interaction.response.send_message(f"✅ Channel Updated diset ke {channel.mention}")
+    await interaction.followup.send(f"✅ Channel Updated diset ke {channel.mention}")
 
 @tree.command(name="channelrequestsetup", description="📌 Set channel + role mention untuk request (Not Found)")
 async def channelrequestsetup(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role = None):
+    await interaction.response.defer(ephemeral=True)  # cegah unknown interaction
     ensure_guild_config(interaction.guild_id)
     config[str(interaction.guild_id)]["request_channel"] = channel.id
     config[str(interaction.guild_id)]["request_role"] = role.id if role else None
@@ -413,7 +417,7 @@ async def channelrequestsetup(interaction: discord.Interaction, channel: discord
     txt = f"✅ Channel Request diset ke {channel.mention}"
     if role:
         txt += f" dan role mention diset ke {role.mention}"
-    await interaction.response.send_message(txt)
+    await interaction.followup.send(txt)
 
 # =============== ON READY ===============
 @bot.event
