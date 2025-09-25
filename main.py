@@ -1,6 +1,8 @@
 import os
+import io
 import json
 import time
+import socket
 import traceback
 import discord
 from discord.ext import tasks
@@ -13,6 +15,9 @@ import aiohttp
 import requests
 from typing import Optional
 
+# ====== Global network guard: jangan pernah hang lama ======
+socket.setdefaulttimeout(20)  # semua koneksi network default timeout 20s
+
 # =============== KEEP-ALIVE (OPTIONAL) ===============
 app = Flask(__name__)
 
@@ -21,13 +26,11 @@ def home():
     return "Bot is alive!"
 
 def run_web():
-    # Bind ke PORT dari env (Render)
-    port = int(os.environ.get("PORT", "8080"))
+    port = int(os.environ.get("PORT", "8080"))  # Render bind
     app.run(host="0.0.0.0", port=port)
 
 def keep_alive():
-    t = Thread(target=run_web, daemon=True)
-    t.start()
+    Thread(target=run_web, daemon=True).start()
 
 # =============== DISCORD SETUP ===============
 intents = discord.Intents.default()
@@ -116,16 +119,9 @@ def initialize_known_files():
         print("Error initializing known_files:", e)
 
 def count_manifests_in_cache(appid: str):
-    """
-    Count number of manifest files in cache for a given appid.
-    We consider files whose name starts with '{appid}' or contains '{appid}.zip'
-    """
     prefix = f"{appid}"
-    count = 0
-    for name in known_files.keys():
-        if name.startswith(prefix) or f"{prefix}.zip" in name:
-            count += 1
-    return count
+    return sum(1 for name in known_files.keys()
+               if name.startswith(prefix) or f"{prefix}.zip" in name)
 
 # =============== STEAM INFO HELPER ===============
 async def fetch_steam_info(appid: str):
@@ -164,10 +160,6 @@ async def fetch_steam_info(appid: str):
 
 # === Multi-CDN resolver untuk header image (pakai link langsung, bukan attachment) ===
 def resolve_header_url(appid: str, hinted_url: Optional[str]) -> Optional[str]:
-    """
-    Pilih URL header paling sehat (200 OK, content-type image) dari beberapa CDN Steam.
-    Urutan: hinted_url (jika ada) -> Fastly -> Cloudflare -> Akamai.
-    """
     candidates = []
     if hinted_url:
         candidates.append(hinted_url)
@@ -177,10 +169,8 @@ def resolve_header_url(appid: str, hinted_url: Optional[str]) -> Optional[str]:
         f"https://cdn.akamai.steamstatic.com/steam/apps/{appid}/header.jpg",
         f"https://steamcdn-a.akamaihd.net/steam/apps/{appid}/header.jpg",
     ])
-
     for url in candidates:
         try:
-            # HEAD cepat; beberapa edge nolak HEAD -> fallback GET
             resp = requests.head(url, timeout=4, allow_redirects=True)
             ct = resp.headers.get("Content-Type", "").lower()
             if resp.status_code == 200 and "image" in ct:
@@ -232,19 +222,17 @@ async def gen(interaction: discord.Interaction, appid: str):
     if interaction.guild_id:
         ensure_guild_config(interaction.guild_id)
 
-    await interaction.response.defer(ephemeral=False)  # jaga agar interaction tidak expired
+    await interaction.response.defer(ephemeral=False)
     start_t = time.perf_counter()
 
     try:
-        # 1) Cari file di Drive
+        # List di Drive
         q = f"name contains '{appid}.zip' and '{FOLDER_ID}' in parents"
         results = drive_service.files().list(
-            q=q,
-            fields="files(id,name,createdTime,modifiedTime,size)"
+            q=q, fields="files(id,name,createdTime,modifiedTime,size)"
         ).execute()
         items = results.get("files", [])
 
-        # 2) Jika tidak ditemukan → kirim embed "Requested (Not Found)"
         if not items:
             info = await fetch_steam_info(appid)
             embed_nf = discord.Embed(
@@ -254,13 +242,10 @@ async def gen(interaction: discord.Interaction, appid: str):
             )
             embed_nf.add_field(name="🔗 Steam", value=f"[Open]({info['steam']})", inline=True)
             embed_nf.add_field(name="📊 SteamDB", value=f"[Open]({info['steamdb']})", inline=True)
-            if info.get("developer"):
-                embed_nf.add_field(name="👨‍💼 Developer", value=info["developer"], inline=True)
-            if info.get("release_date"):
-                embed_nf.add_field(name="📅 Release Date", value=info["release_date"], inline=True)
+            if info.get("developer"): embed_nf.add_field(name="👨‍💼 Developer", value=info["developer"], inline=True)
+            if info.get("release_date"): embed_nf.add_field(name="📅 Release Date", value=info["release_date"], inline=True)
             header_url = resolve_header_url(appid, info.get("header"))
-            if header_url:
-                embed_nf.set_image(url=header_url)
+            if header_url: embed_nf.set_image(url=header_url)
             embed_nf.timestamp = discord.utils.utcnow()
             embed_nf.set_footer(text="Requested via /gen")
 
@@ -279,7 +264,7 @@ async def gen(interaction: discord.Interaction, appid: str):
                         await ch.send(embed=embed_nf)
             return
 
-        # 3) Found → siapkan embed publik dulu (supaya user langsung lihat hasil)
+        # Ditemukan file
         f = items[0]
         file_id, file_name = f["id"], f["name"]
         created = f.get("createdTime", "")
@@ -296,23 +281,20 @@ async def gen(interaction: discord.Interaction, appid: str):
         embed.add_field(name="🆔 AppID", value=appid, inline=True)
         embed.add_field(name="📦 File Size", value=f"{size_kb} KB", inline=True)
         embed.add_field(name="📅 Release Date", value=release_date, inline=True)
-        if info.get("developer"):
-            embed.add_field(name="👨‍💼 Developer", value=info["developer"], inline=True)
+        if info.get("developer"): embed.add_field(name="👨‍💼 Developer", value=info["developer"], inline=True)
         embed.add_field(name="⏱️ Time", value=f"{elapsed:.2f}s", inline=True)
         embed.add_field(name="👤 Requester", value=interaction.user.mention, inline=True)
         embed.add_field(name="🔗 Links", value=f"[Steam]({info['steam']}) | [SteamDB]({info['steamdb']})", inline=False)
         embed.add_field(name="📥 Download", value="File hanya bisa diunduh oleh requester (lihat bawah).", inline=False)
-        if info.get("description"):
-            embed.add_field(name="ℹ️ Info", value=info["description"], inline=False)
+        if info.get("description"): embed.add_field(name="ℹ️ Info", value=info["description"], inline=False)
         header_url = resolve_header_url(appid, info.get("header"))
-        if header_url:
-            embed.set_image(url=header_url)
+        if header_url: embed.set_image(url=header_url)
         embed.timestamp = discord.utils.utcnow()
         embed.set_footer(text="Generated by TechStation Manifest")
 
         await interaction.followup.send(embed=embed, ephemeral=False)
 
-        # 4) Jika file > batas upload Discord → langsung kirim link Drive (tanpa download)
+        # Jika file terlalu besar → langsung link Drive
         if size_bytes > DISCORD_UPLOAD_LIMIT_BYTES:
             dl_link, view_link = ensure_public_link(file_id)
             link_text = dl_link or view_link or f"https://drive.google.com/file/d/{file_id}/view"
@@ -322,14 +304,14 @@ async def gen(interaction: discord.Interaction, appid: str):
             )
             return
 
-        # 5) File masih dalam batas → download streaming dengan timeout aman
+        # Download streaming dengan timeout aman
         tmp_path = f"/tmp/{file_name}"
         try:
             with requests.get(
                 f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
                 headers={"Authorization": f"Bearer {creds.token}"},
                 stream=True,
-                timeout=(15, 60),  # (connect timeout, read timeout)
+                timeout=(15, 60),  # (connect, read)
             ) as r:
                 r.raise_for_status()
                 with open(tmp_path, "wb") as out_f:
@@ -346,7 +328,6 @@ async def gen(interaction: discord.Interaction, appid: str):
             )
             return
 
-        # 6) Kirim file ke requester (ephemeral)
         await interaction.followup.send(
             content="📥 File manifest siap diunduh:",
             file=discord.File(tmp_path, file_name),
@@ -382,7 +363,6 @@ async def check_new_files():
             # NEW
             if fname not in known_files:
                 known_files[fname] = {"id": fid, "mtime": mtime, "ctime": ctime, "size": fsize}
-                # anti-spam Added
                 if fname in notified_files:
                     continue
                 notified_files.add(fname)
@@ -447,18 +427,22 @@ async def notif(interaction: discord.Interaction, mode: str):
     if not _owner_only(interaction):
         await interaction.response.send_message("❌ Hanya owner server yang boleh pakai command ini.", ephemeral=True)
         return
-    global ENABLE_UPLOAD_WATCH
-    m = mode.lower()
     await interaction.response.defer(ephemeral=True)
-    if m == "on":
-        ENABLE_UPLOAD_WATCH = True
-        initialize_known_files()
-        await interaction.followup.send("🔔 Notifikasi Drive: **AKTIF**")
-    elif m == "off":
-        ENABLE_UPLOAD_WATCH = False
-        await interaction.followup.send("🔕 Notifikasi Drive: **NONAKTIF**")
-    else:
-        await interaction.followup.send("Gunakan `/notif on` atau `/notif off`")
+    try:
+        global ENABLE_UPLOAD_WATCH
+        m = mode.lower()
+        if m == "on":
+            ENABLE_UPLOAD_WATCH = True
+            initialize_known_files()
+            await interaction.followup.send("🔔 Notifikasi Drive: **AKTIF**")
+        elif m == "off":
+            ENABLE_UPLOAD_WATCH = False
+            await interaction.followup.send("🔕 Notifikasi Drive: **NONAKTIF**")
+        else:
+            await interaction.followup.send("Gunakan `/notif on` atau `/notif off`")
+    except Exception as e:
+        traceback.print_exc()
+        await interaction.followup.send(f"⚠️ Gagal set notif: {e}", ephemeral=True)
 
 # =============== channel setup (OWNER ONLY) ===============
 @tree.command(name="channeluploadsetup", description="📌 Set channel untuk notif file baru (Added)")
@@ -467,10 +451,14 @@ async def channeluploadsetup(interaction: discord.Interaction, channel: discord.
         await interaction.response.send_message("❌ Hanya owner server yang boleh pakai command ini.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    ensure_guild_config(interaction.guild_id)
-    config[str(interaction.guild_id)]["upload_channel"] = channel.id
-    save_config(config)
-    await interaction.followup.send(f"✅ Channel Added diset ke {channel.mention}")
+    try:
+        ensure_guild_config(interaction.guild_id)
+        config[str(interaction.guild_id)]["upload_channel"] = channel.id
+        save_config(config)
+        await interaction.followup.send(f"✅ Channel Added diset ke {channel.mention}")
+    except Exception as e:
+        traceback.print_exc()
+        await interaction.followup.send(f"⚠️ Gagal set channel Added: {e}", ephemeral=True)
 
 @tree.command(name="channelupdatesetup", description="📌 Set channel untuk notif file update")
 async def channelupdatesetup(interaction: discord.Interaction, channel: discord.TextChannel):
@@ -478,10 +466,14 @@ async def channelupdatesetup(interaction: discord.Interaction, channel: discord.
         await interaction.response.send_message("❌ Hanya owner server yang boleh pakai command ini.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    ensure_guild_config(interaction.guild_id)
-    config[str(interaction.guild_id)]["update_channel"] = channel.id
-    save_config(config)
-    await interaction.followup.send(f"✅ Channel Updated diset ke {channel.mention}")
+    try:
+        ensure_guild_config(interaction.guild_id)
+        config[str(interaction.guild_id)]["update_channel"] = channel.id
+        save_config(config)
+        await interaction.followup.send(f"✅ Channel Updated diset ke {channel.mention}")
+    except Exception as e:
+        traceback.print_exc()
+        await interaction.followup.send(f"⚠️ Gagal set channel Updated: {e}", ephemeral=True)
 
 @tree.command(name="channelrequestsetup", description="📌 Set channel + role mention untuk request (Not Found)")
 async def channelrequestsetup(interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role = None):
@@ -489,14 +481,30 @@ async def channelrequestsetup(interaction: discord.Interaction, channel: discord
         await interaction.response.send_message("❌ Hanya owner server yang boleh pakai command ini.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    ensure_guild_config(interaction.guild_id)
-    config[str(interaction.guild_id)]["request_channel"] = channel.id
-    config[str(interaction.guild_id)]["request_role"] = role.id if role else None
-    save_config(config)
-    txt = f"✅ Channel Request diset ke {channel.mention}"
-    if role:
-        txt += f" dan role mention diset ke {role.mention}"
-    await interaction.followup.send(txt)
+    try:
+        ensure_guild_config(interaction.guild_id)
+        config[str(interaction.guild_id)]["request_channel"] = channel.id
+        config[str(interaction.guild_id)]["request_role"] = role.id if role else None
+        save_config(config)
+        txt = f"✅ Channel Request diset ke {channel.mention}"
+        if role:
+            txt += f" dan role mention diset ke {role.mention}"
+        await interaction.followup.send(txt)
+    except Exception as e:
+        traceback.print_exc()
+        await interaction.followup.send(f"⚠️ Gagal set channel Request: {e}", ephemeral=True)
+
+# =============== GLOBAL COMMAND ERROR HANDLER ===============
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    traceback.print_exc()
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(f"⚠️ Terjadi error: {error}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"⚠️ Terjadi error: {error}", ephemeral=True)
+    except Exception:
+        pass
 
 # =============== ON READY ===============
 @bot.event
